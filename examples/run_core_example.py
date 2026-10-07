@@ -1,12 +1,14 @@
 from __future__ import annotations
 import json
+import sys
 from datetime import datetime
 from pathlib import Path
 
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
 from app.models import BusyBlock, Task
 from app.scheduler import plan
-
-ROOT = Path(__file__).resolve().parents[1]
 data = json.loads((ROOT / "sample_data" / "basic_day.json").read_text())
 
 tasks = [Task(**row) for row in data["tasks"]]
