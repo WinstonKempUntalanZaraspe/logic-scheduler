@@ -11,6 +11,7 @@ preview so Apply sees exactly the same interpretation.
 """
 
 import json
+import re
 from copy import deepcopy
 from datetime import datetime, timedelta
 
@@ -57,6 +58,43 @@ def _has_explicit_date(doc: temporal.TemporalDocument) -> bool:
     return bool(doc.dates)
 
 
+def _sentence_for_evidence(source: str, item) -> str:
+    start = int(item.evidence.start)
+    end = int(item.evidence.end)
+    left = max(source.rfind(".", 0, start), source.rfind(";", 0, start), source.rfind("\n", 0, start))
+    rights = [x for x in (source.find(".", end), source.find(";", end), source.find("\n", end)) if x >= 0]
+    right = min(rights) if rights else len(source)
+    return source[left + 1:right].strip()
+
+
+def _constraint_owned_by_other_planner(source: str, item) -> bool:
+    """Keep venue/arrival clocks in their dedicated logistics compilers.
+
+    Temporal IR is intentionally broad: it should *record* "pool closes at 21:30" and
+    "reach the pool before 20:15". But those clocks are not the task's start/end.
+    Existing venue-availability and arrival-deadline layers already translate them
+    with travel/changing semantics, so applying them again here would be wrong.
+    """
+    clause = _sentence_for_evidence(source, item).lower()
+    if re.search(
+        r"\b(?:pool|gym|library|shop|store|venue|office|school|church|facility|"
+        r"stadium|centre|center|market|mall)\b.{0,80}\b"
+        r"(?:closes?|opens?|shuts?(?:\s+down)?|locks?\s+up|stays?\s+open|"
+        r"is\s+(?:only\s+)?open|is\s+available)\b",
+        clause,
+        re.I,
+    ):
+        return True
+    if re.search(
+        r"\b(?:reach|arrive(?:\s+at)?|get\s+to|be\s+at|get\s+there|be\s+there|"
+        r"clock\s+in)\b.{0,80}\b(?:by|before|no\s+later\s+than)\b",
+        clause,
+        re.I,
+    ):
+        return True
+    return False
+
+
 def _compile_change(change: dict, now: datetime, clarifications: list[dict]) -> None:
     if change.get("action") not in {"create", "update"}:
         return
@@ -73,6 +111,8 @@ def _compile_change(change: dict, now: datetime, clarifications: list[dict]) -> 
 
     for item in doc.constraints:
         if item.negated or item.hypothetical:
+            continue
+        if _constraint_owned_by_other_planner(source, item):
             continue
 
         if item.kind == "deadline" and item.latest_at:
