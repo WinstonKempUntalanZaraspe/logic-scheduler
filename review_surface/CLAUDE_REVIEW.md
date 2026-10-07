@@ -1,8 +1,8 @@
 # Claude review brief
 
-This folder is a **logic-only mirror** of AutoScheduler Pro, sourced from production commit `c205dd86ac449fc26bd5cf4141258e90ec0e5fbc`.
+This folder is a **logic-only mirror** of AutoScheduler Pro, sourced from production commit `a24baf06e5c045900f5b7e4aa3a2147c0000716d`.
 
-The production branch passed an independent Render gate of **90/90 temporal tests** before going live. The review goal is not to rewrite everything; it is to find general logic flaws, missing edge cases, and simplifications that preserve the current contracts.
+The finalized production tree passed an independent Render full-suite gate of **1,248 tests, 0 failures**. The focused temporal suite also passed before the full compatibility gate. The review goal is not to rewrite everything; it is to find general logic flaws, missing edge cases, and simplifications that preserve the current contracts.
 
 ## Review priorities
 
@@ -53,7 +53,7 @@ The production branch passed an independent Render gate of **90/90 temporal test
 
 Start with:
 - `tests/test_temporal_language_benchmark.py`
-- `tests/test_temporal_engine.py`
+- `tests/test_temporal_engine.py` (includes shorthand `6-7pm`, spoken-duration/title and date-vs-clock regressions)
 - `tests/test_temporal_intake_patch.py`
 - `tests/test_quickdump.py`
 - `tests/test_production_reliability_patch.py`
