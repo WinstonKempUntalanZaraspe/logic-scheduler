@@ -38,6 +38,17 @@ _CATEGORY_TITLE_HINTS = [
 ]
 
 
+def _aware(dt: datetime, convert: bool = False) -> datetime:
+    """Normalize scheduler datetimes around the configured local timezone.
+
+    Naive values are interpreted as local. Planning starts are converted to local
+    time before calendar-day logic runs so UTC inputs cannot select the wrong day.
+    """
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=settings.tz)
+    return dt.astimezone(settings.tz) if convert else dt
+
+
 def ceil_grid(dt: datetime, minutes: int = GRID) -> datetime:
     has_partial_minute = bool(dt.second or dt.microsecond)
     dt = dt.replace(second=0, microsecond=0)
@@ -745,6 +756,7 @@ def _plan_cpsat(tasks: list[Task], meta_map: dict[str, dict], busy: list[BusyBlo
     _, horizon_end = _usable_bounds(last_day, config)
 
     source_tasks: list[Task] = []
+    no_work_left: set[str] = set()
     metas: dict[str, TaskMeta] = {}
     durations: dict[str, int] = {}
     for t in tasks:
@@ -759,6 +771,7 @@ def _plan_cpsat(tasks: list[Task], meta_map: dict[str, dict], busy: list[BusyBlo
             warnings.append(f"{t.title}: no usable duration; set a duration or use Unknown/checkpoint")
             continue
         if dur <= 0:
+            no_work_left.add(t.id)
             continue
         source_tasks.append(t)
         metas[t.id] = m
@@ -804,6 +817,18 @@ def _plan_cpsat(tasks: list[Task], meta_map: dict[str, dict], busy: list[BusyBlo
     max_candidates = max(12, int(config.get("max_candidates_per_chunk", 60)))
     between = int(config.get("between_chunks_buffer", 10))
     stability_weight = float(config.get("stability_weight", 0.35))
+
+    # Encode precedence with linear expressions instead of O(A×B) pairwise
+    # candidate conflicts. This keeps dependency-heavy plans tractable.
+    def _minute_expr(rows, key):
+        return sum(int((r[key] - start).total_seconds() // 60) * r["var"] for r in rows)
+
+    def _add_precedence(first_rows, second_rows, gap_minutes, enforce_literals):
+        if first_rows and second_rows:
+            model.Add(
+                _minute_expr(second_rows, "start")
+                >= _minute_expr(first_rows, "end") + gap_minutes
+            ).OnlyEnforceIf(enforce_literals)
 
     chunks: dict[str, list[dict]] = {}
     must_finish_vars: dict[str, object] = {}
@@ -937,10 +962,12 @@ def _plan_cpsat(tasks: list[Task], meta_map: dict[str, dict], busy: list[BusyBlo
         tcs = chunks.get(t.id, [])
         for i in range(1, len(tcs)):
             model.Add(tcs[i]["presence"] <= tcs[i-1]["presence"])
-            for a in tcs[i-1]["candidates"]:
-                for b in tcs[i]["candidates"]:
-                    if b["start"] < a["end"] + timedelta(minutes=between):
-                        model.Add(a["var"] + b["var"] <= 1)
+            _add_precedence(
+                tcs[i-1]["candidates"],
+                tcs[i]["candidates"],
+                between,
+                tcs[i]["presence"],
+            )
         if metas[t.id].must_finish and tcs:
             # Atomic, but never allowed to make the *entire* model infeasible.
             # The solver chooses either every chunk or none; a very large objective
@@ -980,8 +1007,8 @@ def _plan_cpsat(tasks: list[Task], meta_map: dict[str, dict], busy: list[BusyBlo
                 warnings.append(f"{t.title}: a task cannot depend on itself")
                 continue
             dep_task = all_active.get(dep_id)
-            if dep_task is None:
-                continue  # not active => completed/deleted, therefore satisfied
+            if dep_task is None or dep_id in no_work_left:
+                continue  # inactive/deleted, or explicitly no remaining effort => satisfied
             if dep_id in schedulable_ids:
                 dep_chunks = chunks.get(dep_id, [])
                 if not dep_chunks:
@@ -992,10 +1019,22 @@ def _plan_cpsat(tasks: list[Task], meta_map: dict[str, dict], busy: list[BusyBlo
                 dep_last = dep_chunks[0] if session_dependency else dep_chunks[-1]
                 model.Add(child_first["presence"] <= dep_last["presence"] )
                 dep_candidates = [row for ch in dep_chunks for row in ch['candidates']] if session_dependency else dep_last['candidates']
-                for arow in dep_candidates:
-                    for brow in child_first["candidates"]:
-                        if brow["start"] < arow["end"] + timedelta(minutes=dep_gap):
-                            model.Add(arow["var"] + brow["var"] <= 1)
+                if session_dependency:
+                    # A child follows every dependency chunk that actually runs.
+                    for dch in dep_chunks:
+                        _add_precedence(
+                            dch["candidates"],
+                            child_first["candidates"],
+                            dep_gap,
+                            [child_first["presence"], dch["presence"]],
+                        )
+                else:
+                    _add_precedence(
+                        dep_last["candidates"],
+                        child_first["candidates"],
+                        dep_gap,
+                        child_first["presence"],
+                    )
                 if dep_weight > 0 and dep_candidates and child_first["candidates"]:
                     end_terms = [int((row['end']-start).total_seconds()//60//GRID)*row['var'] for row in dep_candidates]
                     if session_dependency:
@@ -1310,6 +1349,7 @@ def _plan_heuristic(tasks: list[Task], meta_map: dict[str, dict], busy: list[Bus
     }
 
     source_tasks: list[Task] = []
+    no_work_left: set[str] = set()
     metas: dict[str, TaskMeta] = {}
     durations: dict[str, int] = {}
     for t in tasks:
@@ -1324,6 +1364,7 @@ def _plan_heuristic(tasks: list[Task], meta_map: dict[str, dict], busy: list[Bus
             warnings.append(f"{t.title}: no usable duration")
             continue
         if dur <= 0:
+            no_work_left.add(t.id)
             continue
         source_tasks.append(t)
         metas[t.id] = m
@@ -1370,7 +1411,7 @@ def _plan_heuristic(tasks: list[Task], meta_map: dict[str, dict], busy: list[Bus
                     blocked = True
                     break
                 dep_task = all_active.get(dep_id)
-                if dep_task is None:
+                if dep_task is None or dep_id in no_work_left:
                     continue
                 if dep_id in remaining:
                     waiting = True
@@ -1673,8 +1714,49 @@ def _adapt_gap_sessions(engine, tasks, meta_map, busy, start, horizon_days, conf
 def plan(tasks: list[Task], meta_map: dict[str, dict], busy: list[BusyBlock], start: datetime, horizon_days: int,
          config: dict, mastery_map: dict[str, float] | None = None):
     mastery_map = mastery_map or {}
+    start = _aware(start, convert=True)
+    busy = [BusyBlock(_aware(b.start, convert=True), _aware(b.end, convert=True), b.label, b.source) for b in busy]
+
+    # IDs key the optimizer's internal tables. Collapse stale duplicate snapshots
+    # deterministically, preferring an actionable copy over a non-actionable one.
+    unique: dict[str, Task] = {}
+    order: list[str] = []
+    duplicate_ids: list[str] = []
+    for task in tasks:
+        if task.id not in unique:
+            unique[task.id] = task
+            order.append(task.id)
+            continue
+        duplicate_ids.append(task.id)
+        current = unique[task.id]
+        current_rank = (int(current.is_actionable), int(not current.is_note), int(bool(current.start and current.end)))
+        candidate_rank = (int(task.is_actionable), int(not task.is_note), int(bool(task.start and task.end)))
+        if candidate_rank > current_rank:
+            unique[task.id] = task
+    tasks = [unique[task_id] for task_id in order]
+
     engine = _plan_cpsat if ORTOOLS_AVAILABLE else _plan_heuristic
     result = engine(tasks, meta_map, busy, start, horizon_days, config, mastery_map)
+
+    # UNKNOWN means the time-limited solver produced no trustworthy solution.
+    # Fall back to the dependency-aware heuristic. FEASIBLE/OPTIMAL results are
+    # never replaced merely because another engine can fill more minutes.
+    if engine is _plan_cpsat and str((result[2] or {}).get("status") or "").upper() == "UNKNOWN":
+        cp_warnings = list(result[1] or [])
+        fallback = _plan_heuristic(tasks, meta_map, busy, start, horizon_days, config, mastery_map)
+        fallback_warnings = [
+            w for w in (fallback[1] or [])
+            if not w.startswith("OR-Tools is not installed")
+        ]
+        diagnostics = dict(fallback[2] or {})
+        diagnostics["fallback_from"] = "cp-sat:UNKNOWN"
+        diagnostics["cp_sat_warnings"] = cp_warnings
+        result = (
+            fallback[0],
+            [*fallback_warnings, "CP-SAT timed out without a usable solution; used the heuristic planner instead"],
+            diagnostics,
+        )
+        engine = _plan_heuristic
     if config.get('maximize_productive_time'):
         # First solve normally to preserve stability. If the resulting plan still
         # leaves a genuinely large awake-time gap, run one short compaction solve
@@ -1743,6 +1825,11 @@ def plan(tasks: list[Task], meta_map: dict[str, dict], busy: list[BusyBlock], st
     ]
     if untimed_fixed:
         warnings = [*warnings, *[f"{title}: #fixed is protected but has no complete TickTick time, so it blocks no interval" for title in untimed_fixed]]
+    if duplicate_ids:
+        warnings = [
+            *warnings,
+            "Duplicate task id(s) were collapsed before planning: " + ", ".join(sorted(set(duplicate_ids))),
+        ]
     return segments, warnings, diagnostics
 
 
