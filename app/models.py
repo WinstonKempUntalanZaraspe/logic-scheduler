@@ -72,6 +72,7 @@ class TaskMeta:
     deadline: Optional[datetime] = None
     earliest: Optional[datetime] = None
     latest_end: Optional[datetime] = None
+    exact_start: Optional[datetime] = None  # hard user-stated start; duration remains separate
     energy: str = "auto"  # auto/high/medium/low
     confidence: str = "medium"  # high/medium/low
     splittable: bool = True
