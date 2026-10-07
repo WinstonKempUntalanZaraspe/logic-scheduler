@@ -1,57 +1,53 @@
 # Logic Scheduler
 
-A logic-focused extract of AutoScheduler for reviewing and improving scheduling decisions.
+A small, public extract of AutoScheduler containing only the code that decides **what gets scheduled, when, and in what order**.
 
-This repository intentionally excludes deployment, OAuth, TickTick/Google account plumbing, databases, UI assets, API keys, personal configuration, and production history.
+It intentionally excludes OAuth, TickTick/Google account plumbing, databases, deployment config, UI code, API keys, personal settings, and production history.
 
-## What the scheduler is supposed to do
+## Inputs
 
-Given:
-- a current local time and planning horizon;
-- tasks with effort estimates, priorities, deadlines, dependencies, energy needs, timing constraints and optional fixed times;
-- hard busy blocks such as classes, appointments and sleep;
-- rules such as minimum chunk sizes, meal/recovery windows, daily budgets and transition time;
+The core planner receives:
 
-the planner should return:
-- a non-overlapping ordered timeline of scheduled task segments;
-- warnings when requested work cannot legally fit;
-- diagnostics explaining remaining work, legal windows and unused/constrained capacity.
+- current time + planning horizon
+- tasks and estimated remaining effort
+- priorities, deadlines, dependencies, energy/timing constraints
+- hard busy blocks
+- sleep/day boundaries, chunk rules and optional daily budgets
 
-Core invariants:
-1. Never overlap hard commitments or protected sleep.
-2. Never schedule completed, abandoned/"Won't Do", expired, or note-only items.
-3. Respect dependency order, earliest/latest bounds, hard stops and allowed weekdays.
-4. Preserve explicit durations and fixed events.
-5. Keep travel/recovery/transition constraints separate from productive work.
-6. Prefer useful productive placement over large avoidable idle gaps.
-7. Distinguish genuinely free time from time where unfinished work exists but is blocked by constraints.
-8. Do not mark a dependency complete merely because only part of its required effort was scheduled.
-9. Replanning may move flexible work, but must not silently move fixed commitments.
-10. The same task should not be scheduled in overlapping duplicate segments.
+## Expected output
 
-## Important files
+`app.scheduler.plan(...)` returns:
 
-- `app/scheduler.py` — core CP-SAT / heuristic assignment, scoring, chunking and compaction.
-- `app/models.py` — task, metadata, busy-block and scheduled-segment models.
-- `app/duration_intelligence.py` — effort estimation.
-- `app/planning_gaps.py` — remaining-capacity / gap diagnostics.
-- `app/decision_patch.py` — higher-level decision scoring.
-- `app/reality_patch.py` — physical/logistics constraints.
-- `app/plan_integrity_patch.py` — plan consistency checks.
-- `app/plan_quality_patch.py` — schedule quality post-processing.
-- `app/final_overlap_guard.py` — final overlap reconciliation.
-- `app/final_task_state_guard.py` — final lifecycle/state boundary.
-- `app/final_productivity_contract_patch.py` and `app/productive_gap_policy_patch.py` — productive-gap policy.
+1. ordered, non-overlapping scheduled segments
+2. warnings for work that cannot legally fit
+3. diagnostics about remaining work and available/constrained capacity
 
-## Running the small core example
+The intended invariants are simple: never overlap hard commitments, never schedule completed/abandoned/note items, respect dependencies and timing bounds, preserve fixed commitments, and prefer useful productive placement over avoidable large gaps.
+
+## Main logic
+
+- `app/scheduler.py` — CP-SAT + fallback scheduling, chunking, scoring, dependency ordering and compaction
+- `app/models.py` — task and schedule data models
+- `app/decision_patch.py` / `app/decision_safety_patch.py` — higher-level decision scoring and safety
+- `app/reality_patch.py` / `app/outing_dependency_patch.py` — physical/logistics constraints
+- `app/final_overlap_guard.py` — final overlap reconciliation
+- `app/final_task_state_guard.py` — final lifecycle/state filter
+- `app/planning_gaps.py` — remaining-capacity and gap diagnostics
+- `app/final_productivity_contract_patch.py` / `app/productive_gap_policy_patch.py` — constrained-vs-free productive-gap policy
+- `app/duration_intelligence.py` — effort estimation
+
+`app/config.py`, `app/db.py`, `app/service.py`, and `app/plan_duration_requests.py` are deliberately tiny logic-lab adapters so the scheduler can be reviewed without pulling in production infrastructure.
+
+## Run the fake example
 
 ```bash
 python -m pip install -r requirements.txt
 python examples/run_core_example.py
+pytest -q
 ```
 
-The sample uses fabricated tasks and times only.
+All sample values are fabricated.
 
 ## Review goal
 
-Improve general scheduling logic, not individual prompt-specific hacks. Changes should generalize across task names and scenarios while preserving the invariants above.
+Improve the general scheduling algorithm, not individual task names or prompt-specific cases. Any change should preserve the invariants above and ideally add a regression test.
