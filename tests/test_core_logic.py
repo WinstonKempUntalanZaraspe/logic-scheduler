@@ -194,3 +194,33 @@ def test_invariant_enforcer_drops_engine_output_that_overlaps(monkeypatch):
     segs, warns, diag = sched.plan([a, b], {}, [block], start, 1, cfg(), {})
     assert [s.title for s in segs] == ["A"] and segs[0].start == start
     assert any("Dropped 2 segment" in w for w in warns)
+
+# --- reviewer adversarial tests (not part of Claude's submission) --------------------
+
+def test_max_chunk_remains_a_ceiling_when_constraints_conflict():
+    chunks = choose_chunks(50, TaskMeta(task_id="x", min_chunk=30, max_chunk=45))
+    assert max(chunks) <= 45, chunks
+
+
+def test_feasible_cpsat_is_not_replaced_by_more_low_value_minutes(monkeypatch):
+    from app.models import Segment
+    import app.scheduler as sched
+
+    start = datetime(2030, 1, 7, 8, 0, tzinfo=UTC)
+    urgent = Task("urgent", "p", "Urgent deadline work", priority=5)
+    filler = Task("filler", "p", "Low priority filler", priority=0)
+    meta = {
+        "urgent": {"duration_minutes": 60, "confidence": "high",
+                   "deadline": (start + timedelta(hours=1)).isoformat(), "must_finish": True},
+        "filler": {"duration_minutes": 120, "confidence": "high"},
+    }
+    cp = [Segment("urgent", "p", urgent.title, start, start + timedelta(minutes=60), 100.0, "cp", urgent)]
+    heur = [Segment("filler", "p", filler.title, start, start + timedelta(minutes=120), 1.0, "heur", filler)]
+
+    monkeypatch.setattr(sched, "_plan_cpsat",
+                        lambda *a, **k: (list(cp), [], {"engine":"cp-sat","status":"FEASIBLE"}))
+    monkeypatch.setattr(sched, "_plan_heuristic",
+                        lambda *a, **k: (list(heur), [], {"engine":"heuristic-fallback","ortools":False}))
+
+    segs, _, _ = sched.plan([urgent, filler], meta, [], start, 1, cfg(), {})
+    assert {s.task_id for s in segs} == {"urgent"}
