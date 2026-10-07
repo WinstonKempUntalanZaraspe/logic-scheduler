@@ -51,3 +51,10 @@ All sample values are fabricated.
 ## Review goal
 
 Improve the general scheduling algorithm, not individual task names or prompt-specific cases. Any change should preserve the invariants above and ideally add a regression test.
+
+
+## Production language / Project Intelligence review surface
+
+The latest production natural-language and learning/project-planning logic is mirrored under `review_surface/`. Start with `review_surface/CLAUDE_REVIEW.md`.
+
+That review surface currently includes the Universal Temporal Language Engine, accidental-task-creation safeguards, semantic fallback/resilience, exam and memorisation intelligence, hackathon/project intelligence, owned-resource + Module Library logic, and the regression tests that define those behaviors. It is a review snapshot from AutoScheduler Pro production commit `c205dd86ac449fc26bd5cf4141258e90ec0e5fbc`; it is intentionally separate from the minimal runnable scheduler extract above.
