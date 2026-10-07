@@ -276,3 +276,23 @@ def test_date_and_duration_numbers_do_not_become_phantom_clock_points():
     assert points == []
     rel = next(x for x in doc.constraints if x.kind == "relative" and x.anchor.lower() == "lunch")
     assert rel.offset_minutes == 10
+
+
+
+def test_clock_range_with_meridiem_only_on_end_is_not_treated_as_numeric_date():
+    doc = parse_temporal("Create event Family dinner tomorrow 6-7pm", NOW)
+    intervals = [x for x in doc.constraints if x.kind == "interval"]
+    assert len(intervals) == 1
+    assert intervals[0].start_at.isoformat() == "2026-10-08T18:00:00+08:00"
+    assert intervals[0].end_at.isoformat() == "2026-10-08T19:00:00+08:00"
+    assert not any(
+        ref.evidence.source == "6-7"
+        for ref in doc.dates
+    )
+
+
+def test_duration_annotations_remain_metadata_not_task_title_text():
+    assert qd._strip_task_modifiers("Buy milk 15m") == "Buy milk"
+    assert qd._strip_task_modifiers("Swim for 2 hours later") == "Swim later"
+    assert qd._strip_task_modifiers("Read chapter 4 60m") == "Read chapter 4"
+    assert qd._strip_task_modifiers("Physics lab report 4h due Friday") == "Physics lab report"

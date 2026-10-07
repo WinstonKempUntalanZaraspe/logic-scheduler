@@ -101,8 +101,37 @@ def _strip_task_modifiers(text: str) -> str:
     # Relationship language such as "after Physics" is intentionally retained so the
     # dependency compiler can still see it.
     from .temporal_engine import strip_temporal_phrases
+    from .live_activity import strip_activity_duration
     s = strip_temporal_phrases(text, datetime.now(settings.tz))
-    s = re.sub(r"\b(?:urgent|high priority|medium priority|low priority|p[123]|fixed|deep work|quick win|quick|flexible)\b", "", s, flags=re.I)
+
+    # Reuse the mature spoken-duration grammar first. It understands forms such as
+    # "an hour and a half", "half an hour", and "one hour and 30 minutes".
+    # The regex pass below then catches compact annotations such as 15m/2h.
+    s = strip_activity_duration(s)
+
+    # Duration is task metadata, not part of a durable title. Preserve ordinary numbers
+    # such as "chapter 4"; remove only number+duration-unit phrases and the optional
+    # leading "for". This restores the mature grammar for "Buy milk 15m",
+    # "swim for 2 hours", "1h 15m", etc.
+    duration_atom = (
+        r"(?:\d+(?:\.\d+)?|a|an|one|two|three|four|five|six|seven|eight|nine|ten|"
+        r"eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|"
+        r"twenty|thirty|forty|fifty|sixty|ninety|half)"
+    )
+    duration_unit = r"(?:hours?|hrs?|hr|h|minutes?|mins?|min|m)"
+    s = re.sub(
+        rf"\b(?:for\s+)?{duration_atom}\s*{duration_unit}"
+        rf"(?:\s*(?:and\s+)?{duration_atom}\s*{duration_unit})?\b",
+        "",
+        s,
+        flags=re.I,
+    )
+    s = re.sub(
+        r"\b(?:urgent|high priority|medium priority|low priority|p[123]|fixed|deep work|quick win|quick|flexible)\b",
+        "",
+        s,
+        flags=re.I,
+    )
     return re.sub(r"\s+", " ", s).strip(" ,:-")
 
 def _category(text: str) -> str | None:

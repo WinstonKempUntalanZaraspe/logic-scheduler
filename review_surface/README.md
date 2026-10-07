@@ -2,12 +2,12 @@
 
 This directory mirrors selected **production logic** from AutoScheduler Pro for external review by Claude or another reviewer.
 
-Source production commit: `c205dd86ac449fc26bd5cf4141258e90ec0e5fbc`
+Source production commit: `a24baf06e5c045900f5b7e4aa3a2147c0000716d`
 
 Production status at mirror time:
 - Universal Temporal Language Engine deployed.
-- Independent Render temporal gate: **90/90 tests passed**.
-- Production backend and frontend: LIVE on the same source tree.
+- Independent Render full-suite gate: **1,248 tests passed, 0 failed**.
+- Final temporal integration is reconciled on production `main`; compatibility fixes include shorthand clock ranges, spoken durations, venue/arrival role ownership, and legacy day-plan behavior.
 
 It is intentionally separate from the runnable minimal scheduler extract under `app/`. Files here may import production-only modules; the goal is code review, reasoning, patch design, and regression analysis without OAuth/UI/deployment noise.
 
