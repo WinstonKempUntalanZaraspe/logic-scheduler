@@ -1,0 +1,26 @@
+{
+  "start": "2030-01-07T08:00:00+00:00",
+  "horizon_days": 1,
+  "tasks": [
+    {"id": "read", "project_id": "study", "title": "Read mechanics chapter", "priority": 3, "tags": ["deep-work"]},
+    {"id": "problems", "project_id": "study", "title": "Solve mechanics problems", "priority": 5, "tags": ["deep-work"]},
+    {"id": "admin", "project_id": "admin", "title": "Process admin notes", "priority": 1, "tags": []},
+    {"id": "abandoned", "project_id": "admin", "title": "Old abandoned task", "priority": 5, "tags": [], "status": -1}
+  ],
+  "meta": {
+    "read": {"duration_minutes": 60, "confidence": "high", "splittable": false},
+    "problems": {"duration_minutes": 90, "confidence": "high", "splittable": true, "min_chunk": 30, "max_chunk": 60, "dependencies": ["read"]},
+    "admin": {"duration_minutes": 30, "confidence": "high", "energy": "low"},
+    "abandoned": {"duration_minutes": 60, "confidence": "high"}
+  },
+  "busy": [
+    {"start": "2030-01-07T10:00:00+00:00", "end": "2030-01-07T11:00:00+00:00", "label": "Fixed appointment", "source": "calendar"}
+  ],
+  "config": {
+    "day_start": "07:00", "day_end": "23:00", "wake_time": "07:00", "sleep_start": "23:00",
+    "meals": [], "max_deep_work_minutes": 240, "between_chunks_buffer": 10,
+    "target_utilization": 0.9, "min_daily_slack_minutes": 0, "candidate_step_minutes": 10,
+    "max_candidates_per_chunk": 80, "solver_time_limit_seconds": 3, "solver_workers": 2,
+    "default_travel_buffer_minutes": 0, "weekly_capacity_minutes": {}, "maximize_productive_time": true
+  }
+}
