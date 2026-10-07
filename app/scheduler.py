@@ -497,7 +497,6 @@ def slot_utility(task: Task, meta: TaskMeta, start: datetime, task_score: float,
             utility -= 18.0 + avoidable_late * (0.55 + deadline_pressure / 180.0)
         else:
             utility -= elapsed_hours * (deadline_pressure / 100.0) * 0.70
-
     # Keep late evening available for recovery/sleep wind-down unless urgency dominates.
     utility -= max(0, start.hour + start.minute / 60 - 20) * float(config.get("late_evening_penalty", 2.5))
     # Timing preference now spans the full planning horizon, not just clock time.
@@ -997,4 +996,879 @@ def _plan_cpsat(tasks: list[Task], meta_map: dict[str, dict], busy: list[BusyBlo
                     model.Add(c["presence"] == activate)
             else:
                 model.Add(activate == 0)
-                for c in tcs:
+                for c in tcs:                    model.Add(c["presence"] == 0)
+                warnings.append(f"{t.title}: Must finish is impossible inside the current hard constraints; no partial block was scheduled")
+
+    # Explicit task dependencies. A dependency is satisfied only if it is no longer active,
+    # or it has a known future/manual block that the dependent can be placed after.
+    # In addition to the hard precedence rule, we softly prefer follow-through soon after
+    # the prerequisite so dependency chains feel human instead of drifting days apart.
+    schedulable_ids = {t.id for t in source_tasks}
+    dependency_penalties = []
+    dep_weight = max(0.0, float(config.get("dependency_proximity_weight", 2.0)))
+    max_gap_slots = max(1, int(math.ceil((horizon_end - start).total_seconds() / 60 / GRID)) + 12)
+    buffer_slots = max(0, int(math.ceil(between / GRID)))
+    by_title = {t.id: t.title for t in tasks}
+    for t in source_tasks:
+        child_chunks = chunks.get(t.id, [])
+        if not child_chunks:
+            continue
+        child_first = child_chunks[0]
+        for dep_id in metas[t.id].dependencies:
+            dep_gap = int((meta_map.get(t.id, {}).get("_dependency_gap_minutes") or {}).get(dep_id, between))
+            dep_gap = max(0, dep_gap)
+            dep_buffer_slots = max(0, int(math.ceil(dep_gap / GRID)))
+            if dep_id == t.id:
+                model.Add(child_first["presence"] == 0)
+                warnings.append(f"{t.title}: a task cannot depend on itself")
+                continue
+            dep_task = all_active.get(dep_id)
+            if dep_task is None or dep_id in no_work_left:
+                continue  # not active, or no effort left => satisfied
+            if dep_id in schedulable_ids:
+                dep_chunks = chunks.get(dep_id, [])
+                if not dep_chunks:
+                    model.Add(child_first["presence"] == 0)
+                    warnings.append(f"{t.title}: prerequisite {by_title.get(dep_id, dep_id)} is active but cannot be scheduled")
+                    continue
+                session_dependency = dep_id in (meta_map.get(t.id, {}).get('_session_dependency_ids') or [])
+                dep_last = dep_chunks[0] if session_dependency else dep_chunks[-1]
+                model.Add(child_first["presence"] <= dep_last["presence"] )
+                dep_candidates = [row for ch in dep_chunks for row in ch['candidates']] if session_dependency else dep_last['candidates']
+                if session_dependency:
+                    # the child must follow every dependency chunk that actually gets scheduled
+                    for dch in dep_chunks:
+                        _add_precedence(dch['candidates'], child_first["candidates"], dep_gap,
+                                        [child_first["presence"], dch["presence"]])
+                else:
+                    _add_precedence(dep_last['candidates'], child_first["candidates"], dep_gap, child_first["presence"])
+                if dep_weight > 0 and dep_candidates and child_first["candidates"]:
+                    end_terms = [int((row['end']-start).total_seconds()//60//GRID)*row['var'] for row in dep_candidates]
+                    if session_dependency:
+                        dep_end_expr = model.NewIntVar(0, max_gap_slots, f'session_end_{dep_id}_{t.id}')
+                        model.AddMaxEquality(dep_end_expr, end_terms)
+                    else:
+                        dep_end_expr = sum(end_terms)
+                    child_start_expr = sum(
+                        int((row["start"] - start).total_seconds() // 60 // GRID) * row["var"]
+                        for row in child_first["candidates"]
+                    )
+                    gap = model.NewIntVar(0, max_gap_slots, f"dep_gap_{dep_id}_{t.id}")
+                    model.Add(gap == child_start_expr - dep_end_expr - dep_buffer_slots).OnlyEnforceIf(child_first["presence"])
+                    model.Add(gap == 0).OnlyEnforceIf(child_first["presence"].Not())
+                    dependency_penalties.append(max(1, int(round(dep_weight * GRID))) * gap)
+                continue
+
+            # Manually scheduled / #fixed / autoschedule-off prerequisite: plan dependent after its future block.
+            if dep_task.end and dep_task.end > start and not dep_task.is_all_day:
+                cutoff = dep_task.end + timedelta(minutes=dep_gap)
+                for brow in child_first["candidates"]:
+                    if brow["start"] < cutoff:
+                        model.Add(brow["var"] == 0)
+                if dep_weight > 0 and child_first["candidates"]:
+                    child_start_expr = sum(
+                        int((row["start"] - start).total_seconds() // 60 // GRID) * row["var"]
+                        for row in child_first["candidates"]
+                    )
+                    cutoff_slot = max(0, int((cutoff - start).total_seconds() // 60 // GRID))
+                    gap = model.NewIntVar(0, max_gap_slots, f"manual_dep_gap_{dep_id}_{t.id}")
+                    model.Add(gap == child_start_expr - cutoff_slot).OnlyEnforceIf(child_first["presence"])
+                    model.Add(gap == 0).OnlyEnforceIf(child_first["presence"].Not())
+                    dependency_penalties.append(max(1, int(round(dep_weight * GRID))) * gap)
+            else:
+                model.Add(child_first["presence"] == 0)
+                warnings.append(f"{t.title}: waiting for unfinished prerequisite {dep_task.title}")
+
+    # Daily utilization/deep-work targets are SOFT. Hard reality (busy time/sleep) remains hard,
+    # but urgent/must-finish work may consume buffer instead of making the whole model infeasible.
+    productive = bool(config.get('maximize_productive_time'))
+    ratio = 1.0 if productive else float(config.get("target_utilization", 0.82))
+    min_slack = 0 if productive else int(config.get("min_daily_slack_minutes", 45))
+    deep_cap = int(config.get("max_deep_work_minutes", 240))
+    daily_caps = {}
+    soft_penalties = []
+    for dd in range(horizon_days):
+        day = (start + timedelta(days=dd)).date()
+        ds, de = _usable_bounds(day, config)
+        if dd == 0:
+            ds = max(ds, start)
+        free_min = sum(int((e - s0).total_seconds() // 60) for s0, e in free_windows(ds, de, hard_busy))
+        target = max(0, min(free_min, int(free_min * ratio), free_min - min_slack if free_min > min_slack else free_min))
+        daily_caps[day.isoformat()] = {"free": free_min, "target": target}
+        day_cands = [c for c in all_candidates if ds <= c["start"] < de]
+        if day_cands:
+            load = sum(c["minutes"] * c["var"] for c in day_cands)
+            model.Add(load <= free_min)
+            over = model.NewIntVar(0, max(0, free_min), f"over_target_{dd}")
+            model.Add(over >= load - target)
+            soft_penalties.append(7 * over)
+            deep = [c for c in day_cands if tag_energy(c["task"], c["meta"]) == "high"]
+            if deep:
+                deep_load = sum(c["minutes"] * c["var"] for c in deep)
+                deep_over = model.NewIntVar(0, max(0, free_min), f"deep_over_{dd}")
+                model.Add(deep_over >= deep_load - deep_cap)
+                soft_penalties.append(10 * deep_over)
+
+    # Weekly/category capacity budgets, e.g. {"Math": 600, "Physics": 360}.
+    # Match names case-insensitively so `math`, `Math`, and ` MATH ` do not
+    # silently become different capacity buckets.
+    raw_budgets = config.get("weekly_capacity_minutes") or {}
+    budgets = {str(k).strip().casefold(): int(v) for k, v in raw_budgets.items() if str(k).strip()}
+    if budgets:
+        grouped: dict[tuple, list[dict]] = defaultdict(list)
+        for c in all_candidates:
+            bucket_raw = c["meta"].weekly_bucket or c["meta"].category
+            bucket = str(bucket_raw or "").strip().casefold()
+            if not bucket or bucket not in budgets:
+                continue
+            iso = c["start"].isocalendar()
+            grouped[(bucket, iso.year, iso.week)].append(c)
+        for (bucket, year, week), rows in grouped.items():
+            model.Add(sum(c["minutes"] * c["var"] for c in rows) <= budgets[bucket])
+
+    # Location-aware travel transitions. Pairwise incompatibility is only added for close non-overlapping candidates.
+    default_travel = int(config.get("default_travel_buffer_minutes", 0))
+    travel_constraints = 0
+    if default_travel > 0 or any(m.transition_minutes for m in metas.values()):
+        ordered = sorted([c for c in all_candidates if c["meta"].location], key=lambda c: c["start"])
+        max_transition = max([default_travel] + [m.transition_minutes for m in metas.values()] + [0])
+        for i, a in enumerate(ordered):
+            for b in ordered[i+1:]:
+                if b["start"] - a["end"] > timedelta(minutes=max_transition):
+                    break
+                if a["task"].id == b["task"].id or a["meta"].location == b["meta"].location:
+                    continue
+                if overlap(a["start"], a["end"], b["start"], b["end"]):
+                    continue  # AddNoOverlap already covers it
+                req = max(default_travel, a["meta"].transition_minutes, b["meta"].transition_minutes)
+                if 0 <= (b["start"] - a["end"]).total_seconds() / 60 < req:
+                    model.Add(a["var"] + b["var"] <= 1)
+                    travel_constraints += 1
+
+    # Recovery between cognitively heavy blocks, even when they are different tasks.
+    # This is a hard safety gap; users can set it to 0 if they deliberately want
+    # back-to-back deep work. Same-task chunks already have their own buffer rule.
+    heavy_recovery = max(0, int(config.get("high_energy_recovery_minutes", 15)))
+    recovery_constraints = 0
+    if heavy_recovery > 0:
+        heavy = sorted([c for c in all_candidates if tag_energy(c["task"], c["meta"]) == "high"], key=lambda c: c["start"])
+        for i, a in enumerate(heavy):
+            for b in heavy[i+1:]:
+                max_req = max(
+                    _recovery_after_minutes(a["minutes"], a["end"], config),
+                    between if a["task"].id == b["task"].id else 0,
+                )
+                if b["start"] - a["end"] >= timedelta(minutes=max_req):
+                    break
+                if overlap(a["start"], a["end"], b["start"], b["end"]):
+                    continue
+                required = max_req
+                if 0 <= (b["start"] - a["end"]).total_seconds() / 60 < required:
+                    model.Add(a["var"] + b["var"] <= 1)
+                    recovery_constraints += 1
+
+    # Soft context-switch cost: preserve flow when two different contexts would
+    # otherwise be placed almost back-to-back. It remains soft so deadlines and
+    # fixed commitments can override it.
+    context_switch_penalties = []
+    context_switch_constraints = 0
+    switch_window = max(0, int(config.get("context_switch_window_minutes", 30)))
+    switch_cost = max(0, int(config.get("context_switch_penalty", 140)))
+    max_switch_constraints = max(0, int(config.get("max_context_switch_constraints", 3500)))
+    if switch_window > 0 and switch_cost > 0:
+        ordered = sorted(all_candidates, key=lambda c: c["start"])
+        for i, a in enumerate(ordered):
+            if context_switch_constraints >= max_switch_constraints:
+                break
+            for b in ordered[i+1:]:
+                if context_switch_constraints >= max_switch_constraints:
+                    break
+                if b["start"] < a["end"]:
+                    continue
+                gap = int((b["start"] - a["end"]).total_seconds() // 60)
+                if gap > switch_window:
+                    break
+                if a["task"].id == b["task"].id or _context_key(a["task"], a["meta"]) == _context_key(b["task"], b["meta"]):
+                    continue
+                both = model.NewBoolVar(f"switch_{i}_{context_switch_constraints}")
+                model.Add(both <= a["var"])
+                model.Add(both <= b["var"])
+                model.Add(both >= a["var"] + b["var"] - 1)
+                scaled = max(1, int(round(switch_cost * (1.0 - 0.45 * gap / max(1, switch_window)))))
+                context_switch_penalties.append(scaled * both)
+                context_switch_constraints += 1
+
+    objective_terms = []
+    started_terms = []
+    completion_terms = []
+    must_finish_terms = []
+    fragmentation_penalties = []
+    partial_penalties = []
+    coverage_per_minute = max(1, int(config.get("coverage_value_per_minute", 12)))
+    if productive:
+        coverage_per_minute = max(24, coverage_per_minute)
+    placement_weight = max(0.0, float(config.get("placement_utility_weight", 5.0)))
+    importance_per_score_minute = max(0.0, float(config.get("importance_value_per_score_minute", 0.055)))
+    fragment_cost = max(0, int(config.get("fragmentation_penalty", 120)))
+    partial_cost = max(0, int(config.get("partial_task_penalty", 90)))
+    for c in all_candidates:
+        # Coverage is minute-based rather than chunk-based, removing the old bias
+        # where highly fragmented long tasks could win simply by having more chunks.
+        task_importance = task_score[c["task"].id]
+        placement_only = c["utility"] - task_importance
+        coef = max(1, int(round(
+            c["minutes"] * (coverage_per_minute + task_importance * importance_per_score_minute)
+            + placement_only * placement_weight
+        )))
+        raw_meta = meta_map.get(c['task'].id, {})
+        if raw_meta.get('intent_optional'):
+            coef = max(1, int(coef * 0.25))
+            if productive:
+                # Optional work keeps lower priority, but useful legal progress
+                # should beat an empty gap when the user wants productive time.
+                # Required work, hard recovery and all bounds still take priority.
+                coef = max(coef, int(c['minutes'] * coverage_per_minute * .25))
+        elif raw_meta.get('_background_fill'):
+            # Background-fill work is not optional: it should use genuinely free
+            # capacity. But it must not crowd out ordinary actionable work merely
+            # because many project chunks collectively earn more coverage/completion
+            # utility. Keep it stronger than optional work but clearly subordinate.
+            scale = max(0.10, min(0.80, float(config.get('background_fill_objective_scale', 0.40))))
+            coef = max(1, int(coef * scale))
+        objective_terms.append(coef * c["var"])
+    for t in source_tasks:
+        tcs = chunks.get(t.id, [])
+        if not tcs:
+            continue
+        started = model.NewBoolVar(f"started_{t.id}")
+        full = model.NewBoolVar(f"full_{t.id}")
+        for ch in tcs:
+            model.Add(started >= ch["presence"])
+        model.Add(started <= sum(ch["presence"] for ch in tcs))
+        for ch in tcs:
+            model.Add(full <= ch["presence"])
+        model.Add(full >= sum(ch["presence"] for ch in tcs) - len(tcs) + 1)
+        raw_meta = meta_map.get(t.id, {})
+        if raw_meta.get('intent_optional'):
+            objective_scale = 0.25
+        elif raw_meta.get('_background_fill'):
+            objective_scale = max(0.10, min(0.80, float(config.get('background_fill_objective_scale', 0.40))))
+        else:
+            objective_scale = 1.0
+        started_terms.append(int((180 + task_score[t.id] * 4) * objective_scale) * started)
+        if meta_map.get(t.id, {}).get('_requested_progress'):
+            started_terms.append(max(0, int(config.get('requested_progress_start_bonus', 50000))) * started)
+        completion_terms.append(int((500 + task_score[t.id] * 8 + pressure.get(t.id, 0.0) * 10) * objective_scale) * full)
+        if fragment_cost:
+            for ch in tcs[1:]:
+                fragmentation_penalties.append(int(fragment_cost * (objective_scale if productive else 1)) * ch["presence"])
+        if partial_cost and len(tcs) > 1:
+            partial = model.NewBoolVar(f"partial_{t.id}")
+            model.Add(partial <= started)
+            model.Add(partial + full <= 1)
+            model.Add(partial >= started - full)
+            partial_penalties.append(int(partial_cost * (objective_scale if productive else 1)) * partial)
+        if t.id in must_finish_vars:
+            must_finish_terms.append(int(1_000_000 + task_score[t.id] * 1_000) * must_finish_vars[t.id])
+    model.Maximize(
+        sum(objective_terms) + sum(started_terms) + sum(completion_terms) + sum(must_finish_terms)
+        - sum(soft_penalties) - sum(dependency_penalties) - sum(context_switch_penalties)
+        - sum(fragmentation_penalties) - sum(partial_penalties)
+    )
+
+    solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = float(config.get("solver_time_limit_seconds", 8.0))
+    solver.parameters.num_search_workers = int(config.get("solver_workers", 8))
+    status = solver.Solve(model)
+    diagnostics.update({
+        "status": solver.StatusName(status),
+        "candidate_count": len(all_candidates),
+        "travel_constraints": travel_constraints,
+        "recovery_constraints": recovery_constraints,
+        "context_switch_constraints": context_switch_constraints,
+        "dependency_proximity_penalties": len(dependency_penalties),
+        "daily_caps": daily_caps,
+        "deadline_pressure": {k: round(v, 2) for k, v in pressure.items()},
+        "schedulable_task_count": len(source_tasks),
+        "note_count_ignored": sum(1 for t in tasks if t.is_note),
+        "objective": solver.ObjectiveValue() if status in (cp_model.OPTIMAL, cp_model.FEASIBLE) else None,
+    })
+    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        warnings.append(f"CP-SAT returned {solver.StatusName(status)}; no schedule was committed")
+        return [], warnings, diagnostics
+
+    segments: list[Segment] = []
+    late_by_task: dict[str, int] = {}
+    for t in source_tasks:
+        tcs = chunks.get(t.id, [])
+        scheduled_count = 0
+        for ci, ch in enumerate(tcs):
+            chosen = next((c for c in ch["candidates"] if solver.Value(c["var"]) == 1), None)
+            if not chosen:
+                continue
+            scheduled_count += 1
+            m = metas[t.id]
+            reason = f"P{t.priority} · {tag_energy(t, m)} energy · score {task_score[t.id]:.1f}"
+            if m.deadline:
+                reason += f" · deadline {m.deadline.strftime('%a %H:%M')}"
+                if chosen["end"] > m.deadline:
+                    late = int(math.ceil((chosen["end"] - m.deadline).total_seconds() / 60.0))
+                    late_by_task[t.id] = max(late_by_task.get(t.id, 0), late)
+                    reason += f" · recovery +{late}m"
+            if m.location:
+                reason += f" · {m.location}"
+            segments.append(Segment(
+                t.id, t.project_id, t.title, chosen["start"], chosen["end"], task_score[t.id], reason,
+                t, ci + 1, len(tcs), m.location, m.category,
+            ))
+        if scheduled_count < len(tcs):
+            missing = sum(ch["minutes"] for ch in tcs[scheduled_count:])
+            if metas[t.id].must_finish:
+                warnings.append(f"{t.title}: Must finish could not fit atomically; no partial block was scheduled")
+            else:
+                warnings.append(f"{t.title}: {missing} min could not fit without breaking constraints/capacity")
+
+    for tid, late in late_by_task.items():
+        title = next((t.title for t in source_tasks if t.id == tid), tid)
+        warnings.append(f"{title}: best recovery plan runs {late} min past its deadline; earlier legal capacity was insufficient or more constrained")
+
+    segments.sort(key=lambda x: x.start)
+    diagnostics["capacity"] = _capacity_report(start, horizon_days, hard_busy, segments, config)
+    return segments, warnings, diagnostics
+
+
+def _plan_heuristic(tasks: list[Task], meta_map: dict[str, dict], busy: list[BusyBlock], start: datetime,
+                    horizon_days: int, config: dict, mastery_map: dict[str, float]):
+    """Dependency-aware compatibility fallback used only when OR-Tools is unavailable."""
+    config = dict(config)
+    config["_plan_start"] = start.isoformat()
+    warnings = ["OR-Tools is not installed; using fallback heuristic. Run: pip install -r requirements.txt"]
+    from .plan_duration_requests import budget_intervals
+    session_rules = budget_intervals(config)
+    hard_busy = _hard_busy(tasks, busy, start, horizon_days, config)
+    between = int(config.get("between_chunks_buffer", 10))
+    raw_budgets = config.get("weekly_capacity_minutes") or {}
+    budgets = {str(k).strip().casefold(): int(v) for k, v in raw_budgets.items() if str(k).strip()}
+    budget_used: dict[tuple[str, int, int], int] = defaultdict(int)
+    all_active = {
+        t.id: t for t in tasks
+        if _task_schedulable_for_plan(t, start) and "autoscheduler-session" not in {x.lower() for x in t.tags}
+    }
+
+    source_tasks: list[Task] = []
+    no_work_left: set[str] = set()  # remaining effort == 0 => prerequisite is effectively done
+    metas: dict[str, TaskMeta] = {}
+    durations: dict[str, int] = {}
+    for t in tasks:
+        tags = {x.lower() for x in t.tags}
+        if (not _task_schedulable_for_plan(t, start)) or "fixed" in tags or "autoscheduler-session" in tags:
+            continue
+        m = build_meta(t, meta_map.get(t.id, {}))
+        if not m.autoschedule:
+            continue
+        dur = duration_for(t, m)
+        if dur is None:
+            warnings.append(f"{t.title}: no usable duration")
+            continue
+        if dur <= 0:
+            no_work_left.add(t.id)
+            continue
+        source_tasks.append(t)
+        metas[t.id] = m
+        durations[t.id] = dur
+
+    last_day = (start + timedelta(days=max(0, horizon_days - 1))).date()
+    _, horizon_end = _usable_bounds(last_day, config)
+    critical = _criticality(source_tasks, metas, durations)
+    pressure = _deadline_pressure(source_tasks, metas, durations, hard_busy, start, horizon_end, config)
+    config["_has_high_energy_demand"] = any(tag_energy(t, metas[t.id]) == "high" for t in source_tasks)
+    info: dict[str, tuple[float, Task, TaskMeta, int]] = {}
+    for t in source_tasks:
+        score = priority_score(
+            t, metas[t.id], start, _mastery_for(t, mastery_map), critical.get(t.id, 0.0), config,
+            pressure.get(t.id, 0.0),
+        )
+        raw_meta = meta_map.get(t.id, {})
+        if raw_meta.get('intent_optional'):
+            score *= 0.25
+        elif raw_meta.get('_background_fill'):
+            # Keep background projects below ordinary P1+ work even when their
+            # roadmap deadline creates artificial urgency.
+            scale = max(0.10, min(0.80, float(config.get('background_fill_objective_scale', 0.40))))
+            score = min(9.0, score * scale)
+        info[t.id] = (score, t, metas[t.id], durations[t.id])
+
+    remaining = dict(info)
+    segments: list[Segment] = []
+    completed_in_plan: dict[str, datetime] = {}
+    progress_in_plan: dict[str, datetime] = {}
+    failed: set[str] = set()
+
+    while remaining:
+        ready: list[tuple[float, Task, TaskMeta, int, datetime]] = []
+        permanently_blocked: list[str] = []
+        for tid, (score, t, m, dur) in remaining.items():
+            dep_after = max(start, m.earliest) if m.earliest else start
+            waiting = False
+            blocked = False
+            for dep_id in m.dependencies:
+                dep_gap = max(0, int((meta_map.get(tid, {}).get("_dependency_gap_minutes") or {}).get(dep_id, between)))
+                session_dependency = dep_id in (meta_map.get(tid, {}).get('_session_dependency_ids') or [])
+                if dep_id == tid or (dep_id in failed and not (session_dependency and dep_id in progress_in_plan)):
+                    blocked = True
+                    break
+                dep_task = all_active.get(dep_id)
+                if dep_task is None or dep_id in no_work_left:
+                    continue
+                if dep_id in remaining:
+                    waiting = True
+                    break
+                if dep_id in completed_in_plan:
+                    dep_after = max(dep_after, completed_in_plan[dep_id] + timedelta(minutes=dep_gap))
+                    continue
+                if session_dependency and dep_id in progress_in_plan:
+                    dep_after = max(dep_after, progress_in_plan[dep_id] + timedelta(minutes=dep_gap))
+                    continue
+                # Active prerequisite that is fixed/manual/unschedulable.
+                if dep_task.end and dep_task.end > start and not dep_task.is_all_day:
+                    dep_after = max(dep_after, dep_task.end + timedelta(minutes=dep_gap))
+                else:
+                    blocked = True
+                    break
+            if blocked:
+                permanently_blocked.append(tid)
+            elif not waiting:
+                ready.append((score, t, m, dur, dep_after))
+
+        for tid in permanently_blocked:
+            _, t, _, _ = remaining.pop(tid)
+            failed.add(tid)
+            warnings.append(f"{t.title}: waiting for an unfinished/unschedulable prerequisite")
+
+        if not ready:
+            if remaining:
+                names = ", ".join(row[1].title for row in remaining.values())
+                warnings.append(f"Dependency cycle or unresolved prerequisite chain: {names}")
+            break
+
+        score, t, m, total, after = max(ready, key=lambda x: x[0])
+        remaining.pop(t.id, None)
+        from .plan_duration_requests import requested_chunks
+        chunks = requested_chunks(t, total, m, config, choose_chunks)
+        placed: list[Segment] = []
+        local_budget_delta: dict[tuple[str, int, int], int] = defaultdict(int)
+        cursor = after
+        for ci, minutes in enumerate(chunks):
+            best = None
+            remaining_after = sum(chunks[ci+1:]) + between * max(0, len(chunks) - ci - 1)
+            for dd in range(horizon_days):
+                day = (start + timedelta(days=dd)).date()
+                if m.allowed_weekdays and day.weekday() not in m.allowed_weekdays:
+                    continue
+                usable_start, de = _usable_bounds(day, config)
+                ds = max(cursor, usable_start)
+                de = min([de, m.latest_end or de, m.hard_stop or de])
+                initial_end = _ctx_dt(meta_map.get(t.id, {}).get('_initial_latest_end'))
+                if ci == 0 and initial_end:
+                    de = min(de, initial_end)
+                occupied = list(hard_busy)
+                current_is_high = tag_energy(t, m) == "high"
+                default_travel = max(0, int(config.get("default_travel_buffer_minutes", 0)))
+                for x in segments + placed:
+                    pad = 0
+                    if current_is_high and (x.task_id in info and tag_energy(info[x.task_id][1], info[x.task_id][2]) == "high"):
+                        prior_minutes = max(1, int((x.end - x.start).total_seconds() // 60))
+                        pad = max(pad, _recovery_after_minutes(prior_minutes, x.end, config))
+                    if m.location and x.location and str(m.location).strip().casefold() != str(x.location).strip().casefold():
+                        other_transition = info[x.task_id][2].transition_minutes if x.task_id in info else 0
+                        pad = max(pad, default_travel, m.transition_minutes, other_transition)
+                    occupied.append(BusyBlock(x.start - timedelta(minutes=pad), x.end + timedelta(minutes=pad), x.title, "planned"))
+                for fs, fe in free_windows(ds, de, occupied):
+                    for s0 in _candidate_starts(fs, fe, minutes, max(GRID, int(config.get("candidate_step_minutes", 10)))):
+                        e0 = s0 + timedelta(minutes=minutes)
+                        over_budget = False
+                        for ids, limit, budget_start, budget_end in session_rules:
+                            if t.id in ids and budget_start <= s0 < budget_end and m.explicit_activity_minutes is None:
+                                used = sum(int((s.end-s.start).total_seconds()//60)
+                                           for s in segments + placed
+                                           if s.task_id in ids and budget_start <= s.start < budget_end)
+                                if used + minutes > limit:
+                                    over_budget = True
+                                    break
+                        if over_budget:                            continue
+                        if not _meal_activity_start_allowed(t.id, s0, config, e0):
+                            continue
+                        bucket = str(m.weekly_bucket or m.category or "").strip().casefold()
+                        if bucket and bucket in budgets:
+                            iso = s0.isocalendar(); key = (bucket, iso.year, iso.week)
+                            if budget_used[key] + local_budget_delta[key] + minutes > budgets[bucket]:
+                                continue
+                        # If the task must finish, do not greedily choose a first chunk so late that
+                        # the remaining chunks cannot possibly fit in this day's current hard window.
+                        if m.must_finish and remaining_after and e0 + timedelta(minutes=remaining_after) > de:
+                            continue
+                        u = slot_utility(t, m, s0, score, config, minutes, pressure.get(t.id, 0.0))
+                        if m.dependencies and after > start:
+                            # Prefer follow-through after prerequisites, but keep this soft so
+                            # sleep, fixed commitments, deadlines and energy can still win.
+                            delay_min = max(0.0, (s0 - after).total_seconds() / 60)
+                            u -= delay_min * float(config.get("dependency_proximity_weight", 2.0)) * 0.05
+                        if m.must_finish:
+                            # Strong early bias for the compatibility engine; CP-SAT handles this globally.
+                            u -= (s0 - ds).total_seconds() / 60 * 0.2
+                        u -= _stability_penalty(t, s0, start, config)
+                        switch_window = max(0, int(config.get("context_switch_window_minutes", 30)))
+                        if switch_window:
+                            for prev in segments + placed:
+                                gap = (s0 - prev.end).total_seconds() / 60.0
+                                if 0 <= gap <= switch_window and prev.task_id in info:
+                                    pm = info[prev.task_id][2]
+                                    pt = info[prev.task_id][1]
+                                    if _context_key(pt, pm) != _context_key(t, m):
+                                        u -= float(config.get("context_switch_utility_penalty", 10.0)) * (1.0 - 0.5 * gap / max(1, switch_window))
+                        if best is None or u > best[0]:
+                            best = (u, s0, e0)
+            if not best:
+                warnings.append(f"{t.title}: could not fit all work")
+                break
+            _, s0, e0 = best
+            placed.append(Segment(t.id, t.project_id, t.title, s0, e0, score, "fallback heuristic", t, ci+1, len(chunks), m.location, m.category))
+            bucket = str(m.weekly_bucket or m.category or "").strip().casefold()
+            if bucket and bucket in budgets:
+                iso = s0.isocalendar(); local_budget_delta[(bucket, iso.year, iso.week)] += minutes
+            cursor = e0 + timedelta(minutes=between)
+
+        complete = len(placed) == len(chunks) and bool(placed)
+        if m.must_finish and not complete:
+            placed = []
+            local_budget_delta.clear()
+            warnings.append(f"{t.title}: Must finish could not be satisfied by fallback constraints; no partial block was scheduled")
+        else:
+            for key, used in local_budget_delta.items():
+                budget_used[key] += used
+
+        segments.extend(placed)
+        if placed:
+            progress_in_plan[t.id] = placed[-1].end
+        if complete:
+            completed_in_plan[t.id] = placed[-1].end
+        else:
+            failed.add(t.id)
+
+    late_by_task: dict[str, int] = {}
+    for seg in segments:
+        m = metas.get(seg.task_id)
+        if m and m.deadline and seg.end > m.deadline:
+            late = int(math.ceil((seg.end - m.deadline).total_seconds() / 60.0))
+            late_by_task[seg.task_id] = max(late_by_task.get(seg.task_id, 0), late)
+    for tid, late in late_by_task.items():
+        title = info[tid][1].title if tid in info else tid
+        warnings.append(f"{title}: best recovery plan runs {late} min past its deadline; earlier legal capacity was insufficient or more constrained")
+
+    segments.sort(key=lambda x: x.start)
+    return segments, warnings, {
+        "engine": "heuristic-fallback",
+        "ortools": False,
+        "optimizer": "smart-v8.2",
+        "schedulable_task_count": len(info),
+        "note_count_ignored": sum(1 for t in tasks if t.is_note),
+        "deadline_pressure": {k: round(v, 2) for k, v in pressure.items()},
+        "capacity": _capacity_report(start, horizon_days, hard_busy, segments, config),
+    }
+
+
+def _remaining_work(tasks, meta_map, segments):
+    from .session_titles import task_base_title
+    rows = []
+    for task in tasks:
+        tags = {x.lower() for x in task.tags}
+        meta = build_meta(task, meta_map.get(task.id, {}))
+        if (not task.is_actionable or task.status != 0 or not meta.autoschedule
+                or tags & {'fixed', 'autoscheduler-session'}):
+            continue
+        total = duration_for(task, meta)
+        if total is None or total <= 0:
+            continue
+        planned = sum(int((s.end-s.start).total_seconds()/60) for s in segments if s.task_id == task.id)
+        if planned >= total:
+            continue
+        rows.append({'task_id': task.id, 'title': task_base_title(task), 'estimated_minutes': total,
+                     'planned_minutes': planned, 'remaining_minutes': total-planned,
+                     'min_session_minutes': min(total-planned, meta.min_chunk) if meta.splittable else total-planned,
+                     'splittable': meta.splittable, 'must_finish': meta.must_finish})
+    return rows
+
+
+def _free_task_windows(task, meta_map, tasks, busy, start, horizon_days, config, segments):
+    """Remaining-work windows with real bounds, prerequisites and recovery applied."""
+    meta = build_meta(task, meta_map.get(task.id, {}))
+    own = [s for s in segments if s.task_id == task.id]
+    earliest = max(start, meta.earliest or start)
+    if own:
+        earliest = max(earliest, max(s.end for s in own) + timedelta(minutes=int(config.get('between_chunks_buffer', 10))))
+    active = {t.id: t for t in tasks if t.is_actionable and t.status == 0}
+    for dep_id in meta.dependencies:
+        dep = active.get(dep_id)
+        if not dep:
+            continue
+        chosen = [s for s in segments if s.task_id == dep_id]
+        session_dep = dep_id in (meta_map.get(task.id, {}).get('_session_dependency_ids') or [])
+        needed = duration_for(dep, build_meta(dep, meta_map.get(dep_id, {})))
+        if needed is not None and needed <= 0:
+            continue  # no effort left on the prerequisite
+        planned = sum(int((s.end-s.start).total_seconds()/60) for s in chosen)
+        if chosen and (session_dep or (needed is not None and planned >= needed)):
+            end = max(s.end for s in chosen)
+        elif (not chosen and dep.end and dep.end > start and not dep.is_all_day
+              and (not build_meta(dep, meta_map.get(dep_id, {})).autoschedule
+                   or 'fixed' in {x.lower() for x in dep.tags} or needed is None)):
+            end = dep.end
+        else:
+            return []
+        gap = max(0, int((meta_map.get(task.id, {}).get('_dependency_gap_minutes') or {}).get(dep_id, config.get('between_chunks_buffer', 10))))
+        earliest = max(earliest, end + timedelta(minutes=gap))
+    occupied = list(_hard_busy(tasks, busy, start, horizon_days, config))
+    high = tag_energy(task, meta) == 'high'
+    for segment in segments:
+        other = build_meta(segment.source_task, meta_map.get(segment.task_id, {}))
+        pad = 0
+        if high and tag_energy(segment.source_task, other) == 'high':
+            pad = _recovery_after_minutes(int((segment.end-segment.start).total_seconds()/60), segment.end, config)
+        if meta.location and segment.location and meta.location.casefold() != segment.location.casefold():
+            pad = max(pad, meta.transition_minutes, other.transition_minutes, int(config.get('default_travel_buffer_minutes', 0)))
+        occupied.append(BusyBlock(segment.start-timedelta(minutes=pad), segment.end+timedelta(minutes=pad), segment.title, 'planned'))
+    for row in (config.get('_task_exclusion_windows') or {}).get(task.id, []):
+        occupied.append(BusyBlock(_ctx_dt(row['start']), _ctx_dt(row['end']), 'Excluded occurrence', 'excluded'))
+    out = []
+    initial_end = _ctx_dt(meta_map.get(task.id, {}).get('_initial_latest_end')) if not own else None
+    for dd in range(horizon_days):
+        day = (start + timedelta(days=dd)).date()
+        if meta.allowed_weekdays and day.weekday() not in meta.allowed_weekdays:
+            continue
+        lower, upper = _usable_bounds(day, config)
+        lower = max(lower, earliest)
+        upper = min(upper, meta.latest_end or upper, meta.hard_stop or upper, initial_end or upper)
+        for a, b in free_windows(lower, upper, occupied) if lower < upper else []:
+            candidates = _candidate_starts(a, b, meta.min_chunk, GRID)
+            first = next((s for s in candidates if _meal_activity_start_allowed(task.id, s, config, s+timedelta(minutes=meta.min_chunk))), None)
+            if first:
+                bucket = str(meta.weekly_bucket or meta.category or '').strip().casefold()
+                budgets = {str(k).strip().casefold(): int(v) for k, v in (config.get('weekly_capacity_minutes') or {}).items()}
+                if bucket in budgets:
+                    week = first.isocalendar()[:2]
+                    used = sum(int((s.end-s.start).total_seconds()/60) for s in segments
+                               if s.start.isocalendar()[:2] == week
+                               and str(build_meta(s.source_task, meta_map.get(s.task_id, {})).weekly_bucket
+                                       or build_meta(s.source_task, meta_map.get(s.task_id, {})).category or '').strip().casefold() == bucket)
+                    b = min(b, first+timedelta(minutes=max(0, budgets[bucket]-used)))
+                if b-first >= timedelta(minutes=meta.min_chunk):
+                    out.append((first, b))
+    return out
+
+
+def _adapt_gap_sessions(engine, tasks, meta_map, busy, start, horizon_days, config, mastery_map, result):
+    """One bounded re-solve; shorten ceilings, preserve chosen work and hard rules."""
+    segments, warnings, diagnostics = result
+    adapted = {tid: dict(raw) for tid, raw in meta_map.items()}
+    changes = []
+    unfinished = {r['task_id']: r for r in _remaining_work(tasks, meta_map, segments)}
+    missing_progress = any(raw.get('_requested_progress') and not any(s.task_id == tid for s in segments)
+                           for tid, raw in meta_map.items() if tid in unfinished)
+    for task in tasks:
+        row = unfinished.get(task.id)
+        meta = build_meta(task, meta_map.get(task.id, {}))
+        share = missing_progress and meta_map.get(task.id, {}).get('_requested_progress')
+        if not row and share:
+            total = duration_for(task, meta)
+            row = {'estimated_minutes': total, 'remaining_minutes': 0} if total else None
+        if not row or not meta.splittable or meta.must_finish or task.repeat_flag:
+            continue
+        chunks = choose_chunks(row['estimated_minutes'], meta)
+        count = sum(s.task_id == task.id for s in segments)
+        next_minutes = chunks[count] if count < len(chunks) else row['remaining_minutes']
+        windows = _free_task_windows(task, meta_map, tasks, busy, start, horizon_days, config, segments)
+        cap = max([int((b-a).total_seconds()/60)//GRID*GRID for a, b in windows] or [0])
+        if (meta.min_chunk <= cap < next_minutes) or (share and meta.max_chunk > meta.min_chunk):
+            ceiling = meta.min_chunk if share else min(meta.max_chunk, cap)
+            adapted.setdefault(task.id, {})['max_chunk'] = ceiling
+            changes.append({'task_id': task.id, 'max_session_minutes': ceiling})
+    if changes:
+        retry_config = dict(config) | {'solver_time_limit_seconds': min(2.0, float(config.get('solver_time_limit_seconds', 8)))}
+        retry = engine(tasks, adapted, busy, start, horizon_days, retry_config, mastery_map)
+        before = {s.task_id: 0 for s in segments}
+        after = {s.task_id: 0 for s in retry[0]}
+        for segment in segments:
+            before[segment.task_id] += int((segment.end-segment.start).total_seconds()/60)
+        for segment in retry[0]:
+            after[segment.task_id] += int((segment.end-segment.start).total_seconds()/60)
+        more_requested = any(raw.get('_requested_progress') and after.get(tid, 0) and not before.get(tid, 0)
+                             for tid, raw in meta_map.items())
+        preserved = all(after.get(tid, 0) >= minutes for tid, minutes in before.items()
+                        if not (more_requested and meta_map.get(tid, {}).get('intent_optional')))
+        accepted = preserved and (sum(after.values()) > sum(before.values()) or more_requested)
+        if accepted:
+            segments, warnings, diagnostics = retry
+            meta_map = adapted
+        diagnostics['gap_session_adaptation'] = {'changes': changes, 'accepted': accepted,
+            'additional_minutes': sum(after.values())-sum(before.values()) if accepted else 0}
+    diagnostics['unfinished_work'] = _remaining_work(tasks, meta_map, segments)
+    for row in diagnostics['unfinished_work']:
+        task = next(t for t in tasks if t.id == row['task_id'])
+        row['legal_windows'] = [{'start': a.isoformat(), 'end': b.isoformat()}
+            for a, b in _free_task_windows(task, meta_map, tasks, busy, start, horizon_days, config, segments)]
+    return segments, warnings, diagnostics
+
+
+def _enforce_hard_invariants(segments, hard_busy):
+    """Last line of defence for the README invariants.
+
+    Whatever the engine did, never return segments that overlap a hard commitment or each
+    other. Keeps the earlier / higher-scored segment and reports what was dropped.
+    """
+    kept: list = []
+    dropped: list = []
+    for seg in sorted(segments or [], key=lambda x: (x.start, -x.score)):
+        clashes_busy = any(overlap(seg.start, seg.end, b.start, b.end) for b in hard_busy)
+        clashes_prev = bool(kept) and seg.start < kept[-1].end
+        if clashes_busy or clashes_prev:
+            dropped.append(seg)
+        else:
+            kept.append(seg)
+    return kept, dropped
+
+
+def _placed_minutes(segments) -> int:
+    return sum(int((x.end - x.start).total_seconds() // 60) for x in segments or [])
+
+
+def _guard_weak_solve(result, tasks, meta_map, busy, start, horizon_days, config, mastery_map):
+    """Never let a time-limited CP-SAT answer lose badly to the fast heuristic planner.
+
+    CP-SAT may return UNKNOWN (no plan at all) or a FEASIBLE-but-poor plan when the model is
+    large and the time limit / CPU is small. The heuristic planner is 10-30x cheaper and obeys
+    the same hard rules, so it serves as a baseline: if the solver was not proven OPTIMAL and the
+    baseline schedules clearly more work (>10%), use the baseline and say so. Returns
+    (result, engine) so later compaction/adaptation re-solves stay on the engine that was kept.
+    """
+    status = (result[2] or {}).get("status")
+    if status == "OPTIMAL":
+        return result, _plan_cpsat
+    baseline = _plan_heuristic(tasks, meta_map, busy, start, horizon_days, config, mastery_map)
+    got, base = _placed_minutes(result[0]), _placed_minutes(baseline[0])
+    if base <= 0 or base <= got * 1.10:
+        return result, _plan_cpsat
+    warnings = [w for w in baseline[1] if not w.startswith("OR-Tools is not installed")]
+    warnings.append(f"CP-SAT ended {status} with {got} min placed; used the heuristic planner ({base} min) instead")
+    diagnostics = dict(baseline[2] or {})
+    diagnostics["fallback_from"] = f"cp-sat:{status}"
+    diagnostics["cp_sat_placed_minutes"] = got
+    diagnostics["baseline_placed_minutes"] = base
+    return (baseline[0], warnings, diagnostics), _plan_heuristic
+
+
+def plan(tasks: list[Task], meta_map: dict[str, dict], busy: list[BusyBlock], start: datetime, horizon_days: int,
+         config: dict, mastery_map: dict[str, float] | None = None):
+    mastery_map = mastery_map or {}
+    start = _aware(start, convert=True)
+    # Task ids key every internal table. A repeated id used to make one solved slot be emitted
+    # twice (two overlapping segments), so keep the first occurrence and report the rest.
+    seen_ids: set[str] = set()
+    unique_tasks: list[Task] = []
+    duplicate_ids: list[str] = []
+    for t in tasks:
+        if t.id in seen_ids:
+            duplicate_ids.append(t.id)
+            continue
+        seen_ids.add(t.id)
+        unique_tasks.append(t)
+    tasks = unique_tasks
+    busy = [BusyBlock(_aware(b.start), _aware(b.end), b.label, b.source) for b in busy]
+    engine = _plan_cpsat if ORTOOLS_AVAILABLE else _plan_heuristic
+    result = engine(tasks, meta_map, busy, start, horizon_days, config, mastery_map)
+    if engine is _plan_cpsat:
+        result, engine = _guard_weak_solve(result, tasks, meta_map, busy, start, horizon_days, config, mastery_map)
+    if config.get('maximize_productive_time'):
+        # First solve normally to preserve stability. If the resulting plan still
+        # leaves a genuinely large awake-time gap, run one short compaction solve
+        # that removes only the anti-churn preference. This lets flexible existing
+        # TickTick work move into large holes instead of being treated as immovable.
+        # We accept the compacted plan only when every task keeps at least as much
+        # scheduled work as before and the largest legal gap actually shrinks.
+        base_segments = list(result[0] or [])
+        def _largest_productive_gap(rows):
+            hard = _hard_busy(tasks, busy, start, horizon_days, config)
+            occupied = list(hard)
+            occupied.extend(BusyBlock(s.start, s.end, s.title, "planned") for s in rows)
+            largest = 0
+            for dd in range(horizon_days):
+                day = (start + timedelta(days=dd)).date()
+                ds, de = _usable_bounds(day, config)
+                if dd == 0:
+                    ds = max(ds, start)
+                for a, b in free_windows(ds, de, occupied):
+                    largest = max(largest, int((b-a).total_seconds() // 60))
+            return largest
+        largest_before = _largest_productive_gap(base_segments)
+        if largest_before >= 45 and base_segments:
+            compact_cfg = dict(config)
+            compact_cfg["_compact_flexible_schedule"] = True
+            compact_cfg["solver_time_limit_seconds"] = min(
+                2.5, float(config.get("solver_time_limit_seconds", 8))
+            )
+            compact = engine(tasks, meta_map, busy, start, horizon_days, compact_cfg, mastery_map)
+            before_by = defaultdict(int)
+            after_by = defaultdict(int)
+            for s in base_segments:
+                before_by[s.task_id] += int((s.end-s.start).total_seconds() // 60)
+            for s in compact[0] or []:
+                after_by[s.task_id] += int((s.end-s.start).total_seconds() // 60)
+            preserved = all(after_by[tid] >= minutes for tid, minutes in before_by.items())
+            largest_after = _largest_productive_gap(compact[0] or [])
+            if preserved and largest_after + 5 < largest_before:
+                compact_diagnostics = dict(compact[2] or {})
+                compact_diagnostics["schedule_compaction"] = {
+                    "applied": True,
+                    "largest_gap_before_minutes": largest_before,
+                    "largest_gap_after_minutes": largest_after,
+                }
+                result = (compact[0], compact[1], compact_diagnostics)
+            else:
+                diagnostics = dict(result[2] or {})
+                diagnostics["schedule_compaction"] = {
+                    "applied": False,
+                    "largest_gap_before_minutes": largest_before,
+                    "largest_gap_after_minutes": largest_after,
+                }
+                result = (result[0], result[1], diagnostics)
+        result = _adapt_gap_sessions(engine, tasks, meta_map, busy, start, horizon_days, config, mastery_map, result)
+    else:
+        result[2]['unfinished_work'] = _remaining_work(tasks, meta_map, result[0])
+        for row in result[2]['unfinished_work']:
+            task = next(t for t in tasks if t.id == row['task_id'])
+            row['legal_windows'] = [{'start': a.isoformat(), 'end': b.isoformat()}
+                for a, b in _free_task_windows(task, meta_map, tasks, busy, start, horizon_days, config, result[0])]
+    segments, warnings, diagnostics = result
+    segments, dropped = _enforce_hard_invariants(segments, _hard_busy(tasks, busy, start, horizon_days, config))
+    if dropped:
+        warnings = [*warnings, f"Dropped {len(dropped)} segment(s) that overlapped a hard commitment or another segment"]
+        diagnostics = dict(diagnostics or {}) | {"invariant_drops": [x.title for x in dropped]}
+    if duplicate_ids:
+        warnings = [*warnings, *[f"Duplicate task id {i!r} ignored (first occurrence kept)" for i in dict.fromkeys(duplicate_ids)]]
+    untimed_fixed = [
+        t.title for t in tasks
+        if t.is_actionable and t.status == 0 and "fixed" in {x.lower() for x in t.tags}
+        and not t.is_all_day and not (t.start and t.end)
+    ]
+    if untimed_fixed:
+        warnings = [*warnings, *[f"{title}: #fixed is protected but has no complete TickTick time, so it blocks no interval" for title in untimed_fixed]]
+    return segments, warnings, diagnostics
+
+
+def schedule_shock(delay_minutes: int) -> str:
+    if delay_minutes < 15:
+        return "absorb"
+    if delay_minutes <= 45:
+        return "shift"
+    if delay_minutes <= 120:
+        return "reoptimize"
+    return "rebuild"
