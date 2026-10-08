@@ -63,3 +63,8 @@ That review surface currently includes the Universal Temporal Language Engine, a
 ### Latest public logic mirror
 
 Unfinished-work carry-forward logic is mirrored under `review_surface/` from production commit `fe34a97f35979c936ab6677af952e55525ba38c5`. Claude should review `review_surface/app/unfinished_carry_forward.py` together with `review_surface/tests/test_unfinished_carry_forward.py` and the temporal/final-state companion files.
+
+
+### Gap-truth fix (Oct 2026)
+
+The runnable core now mirrors production's day-aware gap classification and actual-meal interval reconstruction from `9d9fe25320f5f3f605ad5a184adc02864e1a4066`. `tests/test_day_aware_gap_truth.py` covers Friday's wrongly constrained gaps from Saturday-only work, a phantom 15-minute split caused by the old 18:30 dinner reservation when dinner moved to 19:00, and preserving a real protected buffer. The same source and tests are also in `review_surface/` for Claude.
