@@ -186,8 +186,18 @@ def classify_productivity_gaps(diagnostics: dict) -> dict:
         minutes = max(0, int(gap.get("minutes") or (gap_end - gap_start).total_seconds() // 60))
         original_reason = str(gap.get("reason") or "").strip()
 
+        # A remaining task in the *overall horizon* is not necessarily relevant to
+        # this date. A Saturday-only task must never classify Friday as constrained.
+        # When rebuilding final gaps, the real planner passes date-scoped IDs; direct
+        # legacy callers without the field retain the previous all-work semantics.
+        relevant_ids = gap.get("relevant_unfinished_ids")
+        scoped_unfinished = (
+            [work for work in unfinished if str(work.get("task_id")) in set(map(str, relevant_ids))]
+            if relevant_ids is not None else unfinished
+        )
+
         fitting = []
-        for work in unfinished:
+        for work in scoped_unfinished:
             needed = int(
                 work.get("remaining_minutes")
                 if work.get("must_finish") or not work.get("splittable", True)
@@ -223,7 +233,7 @@ def classify_productivity_gaps(diagnostics: dict) -> dict:
         # unfinished work exists), not for work that silently failed constraints.
         gap["fitting_task_titles"] = []
         restrictions = list(gap.get("constraint_details") or [])
-        for work in unfinished:
+        for work in scoped_unfinished:
             title = str(work.get("title") or work.get("task_id") or "Task")
             windows = [(_dt(w.get("start")), _dt(w.get("end"))) for w in work.get("legal_windows") or []]
             windows = [(a, b) for a, b in windows if a and b and b > a]
@@ -261,12 +271,18 @@ def classify_productivity_gaps(diagnostics: dict) -> dict:
         # Fixed commitments and zero-remaining items are not stranded flexible work,
         # so they do not turn otherwise-free capacity into a false constraint.
         task_state = diagnostics.get("task_state") or {}
-        if not unfinished and task_state.get("state") == "ACTIVE_BUT_NOT_SCHEDULABLE":
+        if not scoped_unfinished and task_state.get("state") == "ACTIVE_BUT_NOT_SCHEDULABLE":
             reason_labels = {
                 "autoschedule_off": "Auto-schedule is turned off",
                 "no_duration": "no usable duration/remaining-work estimate is available",
             }
+            relevant_state_ids = gap.get("relevant_not_schedulable_ids")
+            relevant_state_ids = (
+                set(map(str, relevant_state_ids)) if relevant_state_ids is not None else None
+            )
             for item in task_state.get("not_schedulable") or []:
+                if relevant_state_ids is not None and str(item.get("task_id")) not in relevant_state_ids:
+                    continue
                 reason = reason_labels.get(str(item.get("reason") or ""))
                 if reason:
                     restrictions.append(f"{item.get('title') or 'Task'}: {reason}.")
