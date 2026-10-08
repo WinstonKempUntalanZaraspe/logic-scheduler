@@ -172,7 +172,7 @@ _TEMPORAL_CUE = re.compile(
     r"\b(?:today|tonight|tomorrow|tmr|yesterday|weekday|weekend|monday|tuesday|wednesday|"
     r"thursday|friday|saturday|sunday|morning|afternoon|evening|night|noon|midnight|"
     r"before|after|until|by|later|earlier|from\s+now|every|each|daily|weekly|monthly|yearly|"
-    r"whenever|sometime|anytime|around|about|next\s+week|this\s+week|end\s+of\s+(?:the\s+)?month)\b|"
+    r"whenever|sometime|anytime|around|about|next\s+week|this\s+week|next\s+month|this\s+month|end\s+of\s+(?:the\s+)?month)\b|"
     r"\b\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?)\b",
     re.I,
 )
@@ -691,6 +691,27 @@ def find_date_refs(text: str, now: datetime) -> list[DateRef]:
         else:
             start = monday + (timedelta(days=7) if phrase.startswith("next") else timedelta())
             add(m.start(), m.end(), start, m.group(0), start + timedelta(days=6), "approximate")
+
+    # This/next calendar month as a true date range. Keep "end of next
+    # month" owned by the exact end-of-month parser below.
+    for m in re.finditer(r"\b(?P<mod>this|next)\s+month\b", source, re.I):
+        prefix = source[max(0, m.start() - 12):m.start()]
+        if re.search(r"\bend\s+of\s*$", prefix, re.I):
+            continue
+        if not free(m.start(), m.end()):
+            continue
+        year, month = now.year, now.month
+        if m.group("mod").lower() == "next":
+            month += 1
+            if month == 13:
+                month, year = 1, year + 1
+            start = date(year, month, 1)
+        else:
+            # "this month" means the remaining calendar month, never time travel
+            # back to the first when part of the month has already elapsed.
+            start = now.date()
+        end = date(year, month, calendar.monthrange(year, month)[1])
+        add(m.start(), m.end(), start, m.group(0), end)
 
     # End of this/the month or end of next month.
     for m in re.finditer(r"\bend\s+of\s+(?:(?P<mod>this|next|the)\s+)?month\b", source, re.I):
