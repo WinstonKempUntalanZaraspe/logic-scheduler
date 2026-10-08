@@ -1618,13 +1618,51 @@ def _remaining_work(tasks, meta_map, segments):
     return rows
 
 
+def _dependents_cap(task, meta_map, tasks, segments, config):
+    """Latest moment more of `task` may still run: before any scheduled dependent starts.
+
+    A prerequisite's remaining effort placed after a dependent has begun breaks the
+    dependency order shown to the user. Session-level dependents (which only need one
+    session of this task) do not cap the remainder. Returns (cap, dependent_title) or (None, None).
+    """
+    between = int(config.get('between_chunks_buffer', 10))
+    cap, title = None, None
+    for other in tasks:
+        if other.id == task.id:
+            continue
+        raw = meta_map.get(other.id, {}) or {}
+        if task.id not in list(raw.get('dependencies') or []):
+            continue
+        if task.id in (raw.get('_session_dependency_ids') or []):
+            continue
+        theirs = [s for s in segments if s.task_id == other.id]
+        if not theirs:
+            continue
+        gap = max(0, int((raw.get('_dependency_gap_minutes') or {}).get(task.id, between)))
+        bound = min(s.start for s in theirs) - timedelta(minutes=gap)
+        if cap is None or bound < cap:
+            cap, title = bound, other.title
+    return cap, title
+
+
 def _free_task_windows(task, meta_map, tasks, busy, start, horizon_days, config, segments):
     """Remaining-work windows with real bounds, prerequisites and recovery applied."""
+    from .interactive_quality_speed_patch import _session_budget_remaining
     meta = build_meta(task, meta_map.get(task.id, {}))
     own = [s for s in segments if s.task_id == task.id]
     earliest = max(start, meta.earliest or start)
-    if own:
-        earliest = max(earliest, max(s.end for s in own) + timedelta(minutes=int(config.get('between_chunks_buffer', 10))))
+    between = int(config.get('between_chunks_buffer', 10))
+    raw_self = meta_map.get(task.id, {}) or {}
+    # Remaining effort is interchangeable with the sessions already placed, so it may run
+    # BEFORE them too (own sessions are padded by the between-session buffer below).
+    # Forcing it after the last own session made every earlier idle hour look
+    # "constrained" when nothing but session order stood in the way. The old rule is kept
+    # only when the FIRST session carries its own constraint (exact start / first-session
+    # deadline), because an earlier remainder would become the first session.
+    first_session_bound = bool(getattr(meta, 'exact_start', None) is not None or raw_self.get('_initial_latest_end'))
+    if own and first_session_bound:
+        earliest = max(earliest, max(s.end for s in own) + timedelta(minutes=between))
+    dependents_cap, _ = _dependents_cap(task, meta_map, tasks, segments, config)
     active = {t.id: t for t in tasks if t.is_actionable and t.status == 0}
     for dep_id in meta.dependencies:
         dep = active.get(dep_id)
@@ -1651,6 +1689,8 @@ def _free_task_windows(task, meta_map, tasks, busy, start, horizon_days, config,
         pad = 0
         if high and tag_energy(segment.source_task, other) == 'high':
             pad = _recovery_after_minutes(int((segment.end-segment.start).total_seconds()/60), segment.end, config)
+        if segment.task_id == task.id:
+            pad = max(pad, between)
         if meta.location and segment.location and meta.location.casefold() != segment.location.casefold():
             pad = max(pad, meta.transition_minutes, other.transition_minutes, int(config.get('default_travel_buffer_minutes', 0)))
         occupied.append(BusyBlock(segment.start-timedelta(minutes=pad), segment.end+timedelta(minutes=pad), segment.title, 'planned'))
@@ -1669,7 +1709,7 @@ def _free_task_windows(task, meta_map, tasks, busy, start, horizon_days, config,
             continue
         lower, upper = _usable_bounds(day, config)
         lower = max(lower, earliest)
-        upper = min(upper, meta.latest_end or upper, meta.hard_stop or upper, initial_end or upper)
+        upper = min(upper, meta.latest_end or upper, meta.hard_stop or upper, initial_end or upper, dependents_cap or upper)
         for a, b in free_windows(lower, upper, occupied) if lower < upper else []:
             if exact_first is not None:
                 candidates = [exact_first] if a <= exact_first and exact_first + timedelta(minutes=meta.min_chunk) <= b else []
@@ -1686,6 +1726,11 @@ def _free_task_windows(task, meta_map, tasks, busy, start, horizon_days, config,
                                and str(build_meta(s.source_task, meta_map.get(s.task_id, {})).weekly_bucket
                                        or build_meta(s.source_task, meta_map.get(s.task_id, {})).category or '').strip().casefold() == bucket)
                     b = min(b, first+timedelta(minutes=max(0, budgets[bucket]-used)))
+                # Diagnostics and last-mile placement must share the same daily
+                # allowance. An open clock interval is not permission to exceed it.
+                daily_left = _session_budget_remaining(task.id, day, segments, config)
+                if daily_left is not None:
+                    b = min(b, first + timedelta(minutes=daily_left))
                 if b-first >= timedelta(minutes=meta.min_chunk):
                     out.append((first, b))
     return out
