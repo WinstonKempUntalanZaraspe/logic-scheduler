@@ -44,3 +44,10 @@ Files to review:
 - `tests/test_unfinished_carry_forward.py`
 
 Key contract: **all** forces all proven unfinished flexible work forward; **some** is overflow-aware, guarantees at least one low-risk task moves, keeps remaining eligible work today first, and may spill more only into the requested future destination. Week/month requests remain true date ranges rather than collapsing onto the first day. Fixed, NOTE, completed, Won't Do, recurring, all-day and autoschedule-off work stays excluded.
+
+
+## Latest gap-classification mirror
+
+Production source: `9d9fe25320f5f3f605ad5a184adc02864e1a4066`.
+
+`app/planning_gaps.py`, `app/final_productivity_contract_patch.py`, and `tests/test_day_aware_gap_truth.py` are byte-identical review copies of the production gap-truth fix. They prevent Saturday-only work from marking Friday's idle periods constrained, remove ghost gaps left by displaced default lunch/dinner reservations, and preserve real protected buffers.
