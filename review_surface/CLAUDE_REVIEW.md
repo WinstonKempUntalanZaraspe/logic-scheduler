@@ -96,3 +96,17 @@ Review `app/planning_gaps.py`, `app/final_productivity_contract_patch.py` and `t
 - Meal rules on other days must not disappear when today's flexible meal shifts.
 
 A Docker build-time regression gate also runs in production, but the public runnable-core test file is the review target.
+
+
+## Audited production gap invariants (2026-10-08)
+
+**Deployed production commit:** `23c51fcf84de8bc15578af25346cde94ca1f715d`.
+
+Review copies are available at:
+- `review_surface/app/scheduler.py`
+- `review_surface/app/planning_gaps.py`
+- `review_surface/tests/test_gap_verified_invariants.py`
+
+Claude's original candidate was **not** adopted unchanged. The reviewed implementation corrects its single-session assumption for splittable `must_finish` tasks: an all-or-nothing requirement can be satisfied by multiple individually bounded chunks, but only when the full set can be constructively placed. The actual productive filler has additionally been updated in the private production repo to use final flexible-meal geometry instead of displaced default clock reservations. That full integration file is not mirrored here; review the private production repository if connected.
+
+Render's production Docker gate ran `app.gap_contract_smoke` and the focused pytest suites with **34 passed, 0 failed**. The previous two natural-chain 12:17/12:20 failures are outside these targeted gates; do not assume the entire suite has been re-run on this commit.
