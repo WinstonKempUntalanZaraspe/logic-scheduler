@@ -14,7 +14,7 @@ The planner must never use an abandoned task as work, and it must distinguish:
 4. all schedulable unfinished work is already allocated.
 """
 
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 from .models import Task
 from .config import settings
@@ -153,6 +153,56 @@ def _planning_scope(start, horizon_days, config):
     return today, today + timedelta(days=days - 1), days
 
 
+def _task_plan_window(task, config, start):
+    """Return an explicit plan-local date range for a carried-forward task."""
+    ctx = (config or {}).get("_quick_context") or {}
+    tid = str(task.id)
+    planning_day = start.astimezone(settings.tz).date() if start.tzinfo else start.replace(tzinfo=settings.tz).date()
+    if str(ctx.get("date") or "") != planning_day.isoformat():
+        return None
+    raw = (ctx.get("intent_date_windows") or {}).get(tid)
+    if not isinstance(raw, dict):
+        return None
+    try:
+        begin = date.fromisoformat(str(raw.get("start") or "")[:10])
+        end = date.fromisoformat(str(raw.get("end") or "")[:10])
+    except ValueError:
+        return None
+    if end < begin:
+        return None
+    return begin, end
+
+
+def _persistent_future_window(task, meta_map, start):
+    """Recover a future eligibility window from persisted metadata.
+
+    This is deliberately narrow: only an already-expired source task with both a
+    future latest_end and an explicit earliest can bypass its stale TickTick clock.
+    Ordinary past tasks with no reviewed future metadata stay expired.
+    """
+    if not task.is_expired(start):
+        return None
+    raw = dict((meta_map or {}).get(str(task.id)) or (meta_map or {}).get(task.id) or {})
+
+    # Partial/overflow carry-forward may keep a task eligible today *and* designate
+    # a later disjoint destination (next week/month). Once today's quick context is
+    # gone, revive the stale source task only inside that real future destination,
+    # never in the intervening gap.
+    try:
+        carry_start = date.fromisoformat(str(raw.get("carry_forward_target_start") or "")[:10])
+        carry_end = date.fromisoformat(str(raw.get("carry_forward_target_end") or "")[:10])
+    except ValueError:
+        carry_start = carry_end = None
+    if carry_start and carry_end and carry_end >= start.date() and carry_end >= carry_start:
+        return carry_start, carry_end
+
+    earliest = _dt(raw.get("earliest"))
+    latest = _dt(raw.get("latest_end"))
+    if earliest is None or latest is None or latest <= start or latest < earliest:
+        return None
+    return earliest.date(), latest.date()
+
+
 def _task_plan_date(task, config, start):
     """Explicit plan-local date goals override the source task's current date."""
     ctx = (config or {}).get("_quick_context") or {}
@@ -182,8 +232,29 @@ def _apply_calendar_date_boundary(tasks, meta_map, start, horizon_days, config, 
     excluded = []
 
     for task in tasks or []:
-        target_day = _task_plan_date(task, config, start)
-        if target_day and not (scope_start <= target_day <= scope_end):
+        target_window = (
+            _task_plan_window(task, config, start)
+            or _persistent_future_window(task, scoped_meta, start)
+        )
+        target_day = None if target_window else _task_plan_date(task, config, start)
+
+        if target_window:
+            window_start, window_end = target_window
+            if window_end < scope_start or window_start > scope_end:
+                excluded.append({
+                    "task_id": str(task.id),
+                    "title": task.title,
+                    "date_window": {
+                        "start": window_start.isoformat(),
+                        "end": window_end.isoformat(),
+                    },
+                    "reason": (
+                        f"assigned to {window_start.isoformat()}–{window_end.isoformat()}, "
+                        f"outside requested planning scope {scope_start.isoformat()}–{scope_end.isoformat()}"
+                    ),
+                })
+                continue
+        elif target_day and not (scope_start <= target_day <= scope_end):
             excluded.append({
                 "task_id": str(task.id),
                 "title": task.title,
@@ -194,13 +265,32 @@ def _apply_calendar_date_boundary(tasks, meta_map, start, horizon_days, config, 
 
         kept.append(task)
         tags = {str(x).strip().casefold() for x in (task.tags or [])}
-        if not target_day or "fixed" in tags or task.is_all_day:
+        if "fixed" in tags or task.is_all_day:
+            continue
+
+        raw = scoped_meta.setdefault(str(task.id), dict((meta_map or {}).get(task.id) or {}))
+
+        if target_window:
+            # Explicit carry-forward ranges override the old source task's calendar
+            # date, while retaining task dependencies/deadlines/hard stops. The
+            # optimizer may use any legal day inside this range.
+            window_start, window_end = target_window
+            first_start, _ = scheduler._usable_bounds(window_start, config)
+            _, last_end = scheduler._usable_bounds(window_end, config)
+            current_earliest = _dt(raw.get("earliest"))
+            current_latest = _dt(raw.get("latest_end"))
+            if current_earliest is None or current_earliest < first_start:
+                raw["earliest"] = first_start.isoformat()
+            if current_latest is None or current_latest > last_end:
+                raw["latest_end"] = last_end.isoformat()
+            continue
+
+        if not target_day:
             continue
 
         # A flexible timed task can move within its assigned date, but never backward
         # into an earlier calendar day. Explicit intent_date_goals can reassign the day.
         day_start, day_end = scheduler._usable_bounds(target_day, config)
-        raw = scoped_meta.setdefault(str(task.id), dict((meta_map or {}).get(task.id) or {}))
         current_earliest = _dt(raw.get("earliest"))
         current_latest = _dt(raw.get("latest_end"))
         if current_earliest is None or current_earliest < day_start:
@@ -430,7 +520,15 @@ def install_final_task_state_guard(service_module):
         ]
         lifecycle_tasks = [
             t for t in (tasks or [])
-            if t.is_actionable and not t.is_expired(start) and not _project_command_artifact(t)
+            if t.is_actionable
+            and (
+                not t.is_expired(start)
+                # Explicit reviewed carry-forward authority revives only this task's
+                # scheduling eligibility. Ordinary stale/past tasks remain excluded.
+                or _task_plan_window(t, config, start) is not None
+                or _persistent_future_window(t, meta_map, start) is not None
+            )
+            and not _project_command_artifact(t)
         ]
         clean_tasks, scoped_meta_map, future_scope_excluded, effective_horizon_days, scope_start, scope_end = _apply_calendar_date_boundary(
             lifecycle_tasks, meta_map, start, horizon_days, config, scheduler
