@@ -58,3 +58,8 @@ Improve the general scheduling algorithm, not individual task names or prompt-sp
 The latest production natural-language and learning/project-planning logic is mirrored under `review_surface/`. Start with `review_surface/CLAUDE_REVIEW.md`.
 
 That review surface currently includes the Universal Temporal Language Engine, accidental-task-creation safeguards, semantic fallback/resilience, exam and memorisation intelligence, hackathon/project intelligence, owned-resource + Module Library logic, and the regression tests that define those behaviors. It is a review snapshot from AutoScheduler Pro production commit `a24baf06e5c045900f5b7e4aa3a2147c0000716d`; it is intentionally separate from the minimal runnable scheduler extract above.
+
+
+### Latest public logic mirror
+
+Unfinished-work carry-forward logic is mirrored under `review_surface/` from production commit `fe34a97f35979c936ab6677af952e55525ba38c5`. Claude should review `review_surface/app/unfinished_carry_forward.py` together with `review_surface/tests/test_unfinished_carry_forward.py` and the temporal/final-state companion files.
