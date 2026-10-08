@@ -81,3 +81,18 @@ Please stress-test the general invariant rather than individual phrases:
 - carry-forward eligibility must persist after transient Quick Dump context expires.
 
 Primary regression file: `tests/test_unfinished_carry_forward.py`.
+
+
+## Incremental review: day-aware gap truth and shifted meals
+
+Production source: `9d9fe25320f5f3f605ad5a184adc02864e1a4066`.
+
+Review `app/planning_gaps.py`, `app/final_productivity_contract_patch.py` and `tests/test_day_aware_gap_truth.py`. Key invariants:
+- Unfinished work only eligible on a future day never converts today's genuinely free intervals into CONSTRAINED.
+- Genuine same-day work that cannot legally fit reports CONSTRAINED with a concrete reason.
+- Legal work that fits an idle gap remains CASE A (planner should fill it).
+- Flexible meals are represented by their actual scheduled blocks, not by their displaced configured clock reservations. `13:45–19:00` must remain one contiguous unallocated interval when dinner occurs at `19:00` and no real buffer intervenes.
+- Explicit real transition/travel/recovery buffers remain protected and visible; never merge across one.
+- Meal rules on other days must not disappear when today's flexible meal shifts.
+
+A Docker build-time regression gate also runs in production, but the public runnable-core test file is the review target.
