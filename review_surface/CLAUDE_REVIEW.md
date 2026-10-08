@@ -64,3 +64,20 @@ Start with:
 - `tests/test_module_library.py`
 
 Please propose fixes as general invariants and add/update regression cases for every behavior change.
+
+
+## Incremental review target: unfinished-work carry-forward
+
+Production source for this feature: `fe34a97f35979c936ab6677af952e55525ba38c5`.
+
+Please stress-test the general invariant rather than individual phrases:
+- recognize unfinished-work rescheduling as a scheduler command, never task-creation authority;
+- distinguish `all` from `some`;
+- exact day targets are one-day windows;
+- next week/month are real ranges;
+- partial carry-forward may keep work today first but must not leak into dates between today and the requested future window;
+- remaining effort, dependency metadata, deadlines and lifecycle exclusions must survive;
+- source-side dates such as `today` must not beat an explicit destination such as `to tomorrow`;
+- carry-forward eligibility must persist after transient Quick Dump context expires.
+
+Primary regression file: `tests/test_unfinished_carry_forward.py`.
