@@ -268,9 +268,11 @@ def merge_context(current, incoming):
             merged[key] = deepcopy(incoming.get(key, [] if key.endswith('_ids') or key.endswith('_titles') or key=='intent_exact_order' else None))
         merged['defer_discretionary'] = incoming.get('defer_discretionary', False)
         merged['intent_date_goals'] = deepcopy(incoming.get('intent_date_goals') or {})
+        merged['intent_date_windows'] = deepcopy(incoming.get('intent_date_windows') or {})
         merged['intent_exclusions'] = deepcopy(incoming.get('intent_exclusions') or [])
         merged['requested_project_campaign_ids'] = deepcopy(incoming.get('requested_project_campaign_ids') or [])
         merged['requested_project_work_packages'] = deepcopy(incoming.get('requested_project_work_packages') or {})
+        merged['requested_project_ephemeral_packages'] = deepcopy(incoming.get('requested_project_ephemeral_packages') or {})
     meals = dict(current.get('completed_meals') or {}) | dict(incoming.get('completed_meals') or {})
     if meals:
         merged['completed_meals'] = meals
