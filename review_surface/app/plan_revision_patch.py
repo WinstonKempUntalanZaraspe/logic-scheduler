@@ -64,7 +64,7 @@ _TRANSIENT_KEYS = {
     "intent_only_tonight_ids", "intent_only_tonight_titles", "intent_swim_tomorrow_ids",
     "intent_swim_tomorrow_start", "intent_today_ids", "before_main_study_ids",
     "intent_exact_order", "intent_dinner_start", "intent_dinner_end", "intent_sleep_end",
-    "intent_date_goals", "intent_exclusions", "targeted_schedule_instructions",
+    "intent_date_goals", "intent_date_windows", "intent_exclusions", "targeted_schedule_instructions",
     "defer_discretionary", "human_reality_active", "human_reality_checkpoint_at",
     "fixed_overrides", "suppressed_fixed_task_ids_today", "suppressed_fixed_titles_today",
     "plan_local_dependencies", "plan_local_earliest", "optional_today_ids",
@@ -73,7 +73,7 @@ _TRANSIENT_KEYS = {
     "tomorrow_plan", "future_day_plans", "plan_local_latest_end", "optional_date_goal_ids", "after_meal_task_ids", "personal_venue_overrides",
     "meal_after_task_ids", "meal_not_before",
     "current_activity", "after_meal_rest_minutes", "plan_local_duration_requests",
-    "requested_project_campaign_ids", "requested_project_work_packages",
+    "requested_project_campaign_ids", "requested_project_work_packages", "requested_project_ephemeral_packages",
 }
 
 # Facts that normally survive a change of plan because the later prompt did not make
