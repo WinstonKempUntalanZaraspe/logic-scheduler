@@ -1,10 +1,92 @@
 """Explain actual free time after the complete real-life planner has run."""
 from collections import defaultdict
 from dataclasses import replace
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time
 
 from . import scheduler
+from .config import settings
 from .session_titles import task_base_title
+
+
+def _day_relevant(task, raw, day, config):
+    """Does this unfinished task have any scheduling eligibility on this logical day?
+
+    Work whose earliest allowed start is tomorrow (or a later week/month) must not
+    make every gap *today* read as constrained. This is a date-level check, not
+    a claim that a useful session fits a specific interval.
+    """
+    day_start, day_end = scheduler._usable_bounds(day, config)
+    meta = scheduler.build_meta(task, raw or {})
+
+    def local(when):
+        if when is None:
+            return None
+        return when.replace(tzinfo=settings.tz) if when.tzinfo is None else when.astimezone(settings.tz)
+
+    earliest, latest, hard_stop = local(meta.earliest), local(meta.latest_end), local(meta.hard_stop)
+    if meta.allowed_weekdays and day.weekday() not in meta.allowed_weekdays:
+        return False
+    if earliest and earliest >= day_end:
+        return False
+    if latest and latest <= day_start:
+        return False
+    if hard_stop and hard_stop <= day_start:
+        return False
+    # A future-dated source without an earlier explicit eligibility rule belongs
+    # to its own future day. The final state guard may also inject meta.earliest.
+    source_start = local(getattr(task, 'start', None))
+    if source_start and source_start >= day_end and not earliest:
+        return False
+    return True
+
+
+def _actual_meal_aware_hard_busy(tasks, busy, start, horizon_days, config, diagnostics):
+    """Do not subtract a stale clock reservation AND its moved flexible meal.
+
+    `_hard_busy` merges overlapping blocks, losing each block's source/label.
+    Build the non-meal blockers first, then restore only default meal reservations
+    that do not have an authoritative flexible-meal block for the same day/name.
+    """
+    chosen_meals = diagnostics.get('flexible_meals') or []
+    if not chosen_meals:
+        return list(scheduler._hard_busy(tasks, busy, start, horizon_days, config))
+
+    actual = set()
+    for meal in chosen_meals:
+        try:
+            when = datetime.fromisoformat(str(meal['start']))
+            end = datetime.fromisoformat(str(meal['end']))
+            name = str(meal.get('name') or meal.get('label') or '').strip().casefold()
+            if name and end > when:
+                actual.add((when.date(), name))
+        except (TypeError, ValueError, KeyError):
+            continue
+
+    blockers = list(scheduler._hard_busy(
+        tasks, busy, start, horizon_days, dict(config or {}, meals=[])
+    ))
+    for day_index in range(horizon_days):
+        day = (start + timedelta(days=day_index)).date()
+        lower, upper = scheduler._usable_bounds(day, config)
+        for meal in config.get('meals') or []:
+            try:
+                name = str(meal['name'])
+                if (day, name.strip().casefold()) in actual:
+                    continue
+                clock = time.fromisoformat(str(meal['start']))
+                minutes = int(meal['minutes'])
+                if minutes <= 0:
+                    continue
+                meal_start = datetime.combine(day, clock, settings.tz)
+                if meal_start < lower:
+                    meal_start += timedelta(days=1)
+                if lower <= meal_start < upper:
+                    blockers.append(scheduler.BusyBlock(
+                        meal_start, meal_start + timedelta(minutes=minutes), name, 'rules'
+                    ))
+            except (KeyError, TypeError, ValueError):
+                continue
+    return blockers
 
 
 def rebuild_final_gaps(segments, diagnostics, tasks, busy, start, horizon_days, config, meta_map=None):
@@ -33,7 +115,9 @@ def rebuild_final_gaps(segments, diagnostics, tasks, busy, start, horizon_days, 
             except (ValueError, TypeError, KeyError):
                 continue
         diagnostics[key]=kept
-    blockers = list(scheduler._hard_busy(tasks, busy, start, horizon_days, config))
+    blockers = _actual_meal_aware_hard_busy(
+        tasks, busy, start, horizon_days, config, diagnostics
+    )
     blockers.extend(scheduler.BusyBlock(s.start, s.end, s.title, 'planned') for s in segments)
     for key in ('fixed_timeline', 'reality_timeline', 'flexible_meals', 'human_uncertainty_buffers'):
         for row in diagnostics.get(key) or []:
@@ -58,24 +142,28 @@ def rebuild_final_gaps(segments, diagnostics, tasks, busy, start, horizon_days, 
     for gap in gaps:
         a,b = datetime.fromisoformat(gap['start']),datetime.fromisoformat(gap['end'])
         evidence=[]
+        relevant_unfinished=[]
+        relevant_non_schedulable=[]
         for task in tasks:
             raw=(meta_map or {}).get(task.id,{})
-            if str(task.id) not in remaining_ids and not raw.get('removed_prerequisites'):
+            if not task.is_actionable or not _day_relevant(task, raw, a.date(), config):
                 continue
             meta=scheduler.build_meta(task,raw)
-            if not task.is_actionable or not meta.autoschedule or 'fixed' in task.tags:
-                continue
-            if meta.earliest and meta.earliest >= b:
-                evidence.append(f"{task.title}: earliest allowed start is {meta.earliest.strftime('%a %d %b %H:%M')}.")
-            elif meta.latest_end and meta.latest_end <= a:
-                evidence.append(f"{task.title}: its allowed window ended at {meta.latest_end.strftime('%a %d %b %H:%M')}.")
-            elif meta.allowed_weekdays and a.weekday() not in meta.allowed_weekdays:
-                evidence.append(f"{task.title}: not allowed on {a.strftime('%A')} by its weekday rule.")
-            elif raw.get('weekly_bucket') and 0 <= int((config.get('weekly_capacity_minutes') or {}).get(raw['weekly_bucket'], -1)) < meta.min_chunk:
-                evidence.append(f"{task.title}: its weekly time budget is smaller than its minimum session.")
-            elif raw.get('removed_prerequisites'):
+            if str(task.id) in remaining_ids and meta.autoschedule and 'fixed' not in {x.casefold() for x in task.tags}:
+                relevant_unfinished.append(str(task.id))
+                if meta.earliest and meta.earliest >= b:
+                    evidence.append(f"{task.title}: earliest allowed start is {meta.earliest.strftime('%a %d %b %H:%M')}.")
+                elif meta.latest_end and meta.latest_end <= a:
+                    evidence.append(f"{task.title}: its allowed window ended at {meta.latest_end.strftime('%a %d %b %H:%M')}.")
+                elif raw.get('weekly_bucket') and 0 <= int((config.get('weekly_capacity_minutes') or {}).get(raw['weekly_bucket'], -1)) < meta.min_chunk:
+                    evidence.append(f"{task.title}: its weekly time budget is smaller than its minimum session.")
+            if not meta.autoschedule or scheduler.duration_for(task, meta) is None:
+                relevant_non_schedulable.append(str(task.id))
+            if str(task.id) in remaining_ids and raw.get('removed_prerequisites'):
                 evidence.append(f"{task.title}: waiting for a removed prerequisite; its dependency must be resolved first.")
-        gap['constraint_details']=evidence
+        gap['relevant_unfinished_ids']=relevant_unfinished
+        gap['relevant_not_schedulable_ids']=relevant_non_schedulable
+        gap['constraint_details']=list(dict.fromkeys(evidence))
     diagnostics['planning_gaps'] = gaps
     return classify_productivity_gaps(diagnostics)
 
